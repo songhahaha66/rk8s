@@ -1,31 +1,33 @@
-use rfuse3::raw::reply::{FileAttr, ReplyXAttr};
+use rfuse3::raw::reply::{FileAttr, ReplyEntry, ReplyCreated};
 use rfuse3::{
     Inode, Result,
-    raw::{Filesystem, Request, reply::ReplyEntry},
+    raw::{Filesystem, Request},
 };
 use std::ffi::OsStr;
 use std::io::Error;
+use std::time::Duration;
 
 use crate::passthrough::PassthroughFs;
-pub const OPAQUE_XATTR_LEN: u32 = 16;
 pub const OPAQUE_XATTR: &str = "user.fuseoverlayfs.opaque";
-pub const UNPRIVILEGED_OPAQUE_XATTR: &str = "user.overlay.opaque";
-pub const PRIVILEGED_OPAQUE_XATTR: &str = "trusted.overlay.opaque";
+// pub const OPAQUE_XATTR_LEN: u32 = 16;
+// pub const UNPRIVILEGED_OPAQUE_XATTR: &str = "user.overlay.opaque";
+// pub const PRIVILEGED_OPAQUE_XATTR: &str = "trusted.overlay.opaque";
 
 /// A filesystem must implement Layer trait, or it cannot be used as an OverlayFS layer.
-pub trait Layer: Filesystem {
+pub trait Layer: Filesystem + Send + Sync + 'static {
     /// Return the root inode number
     fn root_inode(&self) -> Inode;
     /// Create whiteout file with name <name>.
     ///
     /// If this call is successful then the lookup count of the `Inode` associated with the returned
     /// `Entry` must be increased by 1.
-    async fn create_whiteout(
+    fn create_whiteout(
         &self,
         ctx: Request,
         parent: Inode,
         name: &OsStr,
-    ) -> Result<ReplyEntry> {
+    ) -> impl std::future::Future<Output = Result<ReplyEntry>> + Send {
+        async move {
         // Use temp value to avoid moved 'parent'.
         let ino: u64 = parent;
         match self.lookup(ctx, ino, name).await {
@@ -60,10 +62,12 @@ pub trait Layer: Filesystem {
         let dev = libc::makedev(0, 0);
         let mode = libc::S_IFCHR | 0o777;
         self.mknod(ctx, ino, name, mode, dev as u32).await
+        }
     }
 
     /// Delete whiteout file with name <name>.
-    async fn delete_whiteout(&self, ctx: Request, parent: Inode, name: &OsStr) -> Result<()> {
+    fn delete_whiteout(&self, ctx: Request, parent: Inode, name: &OsStr) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
         // Use temp value to avoid moved 'parent'.
         let ino: u64 = parent;
         match self.lookup(ctx, ino, name).await {
@@ -86,18 +90,23 @@ pub trait Layer: Filesystem {
             Err(e) => return Err(e),
         }
         Ok(())
+        }
     }
 
     /// Check if the Inode is a whiteout file
-    async fn is_whiteout(&self, ctx: Request, inode: Inode) -> Result<bool> {
+    fn is_whiteout(&self, ctx: Request, inode: Inode) -> impl std::future::Future<Output = Result<bool>> + Send 
+    where Self: Send {
+        async move {
         let rep = self.getattr(ctx, inode, None, 0).await?;
 
         // Check attributes of the inode to see if it's a whiteout char device.
         Ok(is_whiteout(&rep.attr))
+        }
     }
 
     /// Set the directory to opaque.
-    async fn set_opaque(&self, ctx: Request, inode: Inode) -> Result<()> {
+    fn set_opaque(&self, ctx: Request, inode: Inode) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
         // Use temp value to avoid moved 'parent'.
         let ino: u64 = inode;
 
@@ -111,74 +120,124 @@ pub trait Layer: Filesystem {
         // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
         self.setxattr(ctx, ino, OsStr::new(OPAQUE_XATTR), b"y", 0, 0)
             .await
+        }
     }
 
     /// Check if the directory is opaque.
-    async fn is_opaque(&self, ctx: Request, inode: Inode) -> Result<bool> {
-        // Use temp value to avoid moved 'parent'.
-        let ino: u64 = inode;
-
-        // Get attributes of the directory.
-        let attr: rfuse3::raw::prelude::ReplyAttr = self.getattr(ctx, ino, None, 0).await?;
-        if !is_dir(&attr.attr) {
-            return Err(Error::from_raw_os_error(libc::ENOTDIR).into());
+    fn is_opaque(&self, _ctx: Request, _inode: Inode) -> impl std::future::Future<Output = Result<bool>> + Send 
+    where Self: Send {
+        async move {
+            // Default implementation - override in specific Layer implementations
+            Ok(false)
         }
-
-        // Return Result<is_opaque>.
-        let check_attr = |inode: Inode, attr_name: &'static str, attr_size: u32| async move {
-            let cname = OsStr::new(attr_name);
-            match self.getxattr(ctx, inode, cname, attr_size).await {
-                Ok(v) => {
-                    // xattr name exists and we get value.
-                    if let ReplyXAttr::Data(bufs) = v
-                        && bufs.len() == 1
-                        && bufs[0].eq_ignore_ascii_case(&b'y')
-                    {
-                        return Ok(true);
-                    }
-                    // No value found, go on to next check.
-                    Ok(false)
-                }
-                Err(e) => {
-                    let ioerror: std::io::Error = e.into();
-                    if let Some(raw_error) = ioerror.raw_os_error()
-                        && raw_error == libc::ENODATA
-                    {
-                        return Ok(false);
-                    }
-
-                    Err(e)
-                }
-            }
-        };
-
-        // A directory is made opaque by setting some specific xattr to "y".
-        // See ref: https://docs.kernel.org/filesystems/overlayfs.html#whiteouts-and-opaque-directories
-
-        // Check our customized version of the xattr "user.fuseoverlayfs.opaque".
-        let is_opaque = check_attr(ino, OPAQUE_XATTR, OPAQUE_XATTR_LEN).await?;
-        if is_opaque {
-            return Ok(true);
-        }
-
-        // Also check for the unprivileged version of the xattr "trusted.overlay.opaque".
-        let is_opaque = check_attr(ino, PRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN).await?;
-        if is_opaque {
-            return Ok(true);
-        }
-
-        // Also check for the unprivileged version of the xattr "user.overlay.opaque".
-        let is_opaque = check_attr(ino, UNPRIVILEGED_OPAQUE_XATTR, OPAQUE_XATTR_LEN).await?;
-        if is_opaque {
-            return Ok(true);
-        }
-
-        Ok(false)
     }
+
+    /// Helper method to get file attributes with bypassed mapping for copy-up operations
+    fn getattr_helper(
+        &self,
+        inode: Inode,
+        handle: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<(libc::stat64, Duration)>> + Send;
+
+    /// Helper method to create directory with specific UID/GID for copy-up operations
+    fn mkdir_helper(
+        &self,
+        req: Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> impl std::future::Future<Output = Result<ReplyEntry>> + Send;
+
+    /// Helper method to create symlink with specific UID/GID for copy-up operations
+    fn symlink_helper(
+        &self,
+        req: Request,
+        parent: Inode,
+        name: &OsStr,
+        link: &OsStr,
+        uid: u32,
+        gid: u32,
+    ) -> impl std::future::Future<Output = Result<ReplyEntry>> + Send;
+
+    /// Helper method to create file with specific UID/GID for copy-up operations
+    fn create_helper(
+        &self,
+        req: Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+    ) -> impl std::future::Future<Output = Result<ReplyCreated>> + Send;
 }
 impl Layer for PassthroughFs {
     fn root_inode(&self) -> Inode {
         1
+    }
+
+    fn getattr_helper(
+        &self,
+        inode: Inode,
+        handle: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<(libc::stat64, Duration)>> + Send {
+        async move {
+            self.do_getattr_helper(inode, handle).await.map_err(Into::into)
+        }
+    }
+
+    fn mkdir_helper(
+        &self,
+        req: Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> impl std::future::Future<Output = Result<ReplyEntry>> + Send {
+        async move {
+            self.do_mkdir_helper(req, parent, name, mode, umask, uid, gid).await
+        }
+    }
+
+    fn symlink_helper(
+        &self,
+        req: Request,
+        parent: Inode,
+        name: &OsStr,
+        link: &OsStr,
+        uid: u32,
+        gid: u32,
+    ) -> impl std::future::Future<Output = Result<ReplyEntry>> + Send {
+        async move {
+            self.do_symlink_helper(req, parent, name, link, uid, gid).await
+        }
+    }
+
+    fn create_helper(
+        &self,
+        req: Request,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+    ) -> impl std::future::Future<Output = Result<ReplyCreated>> + Send {
+        async move {
+            self.do_create_helper(req, parent, name, mode, flags, uid, gid).await
+        }
+    }
+
+    fn is_opaque(&self, _ctx: Request, _inode: Inode) -> impl std::future::Future<Output = Result<bool>> + Send {
+        async move {
+            // Default implementation - override in specific Layer implementations
+            Ok(false)
+        }
     }
 }
 pub(crate) fn is_dir(st: &FileAttr) -> bool {

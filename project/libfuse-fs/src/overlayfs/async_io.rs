@@ -1,5 +1,5 @@
 use super::Inode;
-use super::OverlayFs;
+use super::{OverlayFs, layer::Layer};
 use super::utils;
 use crate::overlayfs::HandleData;
 use crate::overlayfs::RealHandle;
@@ -17,7 +17,7 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 
-impl Filesystem for OverlayFs {
+impl<L: Layer + Send + Sync> Filesystem for OverlayFs<L> {
     /// initialize filesystem. Called before any other filesystem method.
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
         if self.config.do_import {
@@ -97,7 +97,7 @@ impl Filesystem for OverlayFs {
             }
         }
 
-        let node: Arc<super::OverlayInode> = self.lookup_node(req, inode, "").await?;
+        let node: Arc<super::OverlayInode<L>> = self.lookup_node(req, inode, "").await?;
         let (layer, _, lower_inode) = node.first_layer_inode().await;
         let mut re = layer.getattr(req, lower_inode, None, flags).await?;
         re.attr.ino = inode;
@@ -424,7 +424,7 @@ impl Filesystem for OverlayFs {
         write_flags: u32,
         flags: u32,
     ) -> Result<ReplyWrite> {
-        let handle_data: Arc<HandleData> = self.get_data(req, Some(fh), inode, flags).await?;
+        let handle_data: Arc<HandleData<L>> = self.get_data(req, Some(fh), inode, flags).await?;
 
         match handle_data.real_handle {
             None => Err(Error::from_raw_os_error(libc::ENOENT).into()),

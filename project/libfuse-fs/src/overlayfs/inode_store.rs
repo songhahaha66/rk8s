@@ -8,17 +8,19 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::passthrough::VFS_MAX_INO;
 
-use super::{Inode, OverlayInode};
+use super::{Inode, OverlayInode, layer::Layer};
 
 use futures::future::join_all;
 use radix_trie::Trie;
 use tracing::{error, trace};
 
-pub struct InodeStore {
+/// InodeStore is a generic data structure for managing inodes.
+/// It is parameterized by a type `L` that implements the `Layer` trait.
+pub struct InodeStore<L: Layer + Send + Sync> {
     // Active inodes.
-    inodes: HashMap<Inode, Arc<OverlayInode>>,
+    inodes: HashMap<Inode, Arc<OverlayInode<L>>>,
     // Deleted inodes which were unlinked but have non zero lookup count.
-    deleted: HashMap<Inode, Arc<OverlayInode>>,
+    deleted: HashMap<Inode, Arc<OverlayInode<L>>>,
     // Path to inode mapping, used to reserve inode number for same path.
     path_mapping: Trie<String, Inode>,
     next_inode: u64,
@@ -27,7 +29,7 @@ pub struct InodeStore {
     nlinks: HashMap<Inode, Arc<AtomicU64>>,
 }
 
-impl InodeStore {
+impl<L: Layer + Send + Sync> InodeStore<L> {
     pub(crate) fn new() -> Self {
         Self {
             inodes: HashMap::new(),
@@ -68,7 +70,7 @@ impl InodeStore {
         }
     }
 
-    pub(crate) async fn insert_inode(&mut self, inode: Inode, node: Arc<OverlayInode>) {
+    pub(crate) async fn insert_inode(&mut self, inode: Inode, node: Arc<OverlayInode<L>>) {
         self.path_mapping
             .insert(node.path.read().await.clone(), inode);
         self.nlinks
@@ -78,11 +80,11 @@ impl InodeStore {
         self.inodes.entry(inode).or_insert(node);
     }
 
-    pub(crate) fn get_inode(&self, inode: Inode) -> Option<Arc<OverlayInode>> {
+    pub(crate) fn get_inode(&self, inode: Inode) -> Option<Arc<OverlayInode<L>>> {
         self.inodes.get(&inode).cloned()
     }
 
-    pub(crate) fn get_deleted_inode(&self, inode: Inode) -> Option<Arc<OverlayInode>> {
+    pub(crate) fn get_deleted_inode(&self, inode: Inode) -> Option<Arc<OverlayInode<L>>> {
         self.deleted.get(&inode).cloned()
     }
 
@@ -91,7 +93,7 @@ impl InodeStore {
         &mut self,
         inode: Inode,
         path_removed: Option<String>,
-    ) -> Option<Arc<OverlayInode>> {
+    ) -> Option<Arc<OverlayInode<L>>> {
         let old_nlink = self.nlinks.get(&inode)?.fetch_sub(1, Ordering::Relaxed);
 
         if let Some(path) = path_removed {
@@ -156,15 +158,23 @@ impl InodeStore {
         self.next_inode = next_inode;
         self.inode_limit = limit_inode;
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.inodes.clear();
+        self.deleted.clear();
+        self.path_mapping = Trie::new();
+        self.nlinks.clear();
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::passthrough::PassthroughFs;
 
     #[tokio::test]
     async fn test_alloc_unique() {
-        let mut store = InodeStore::new();
+        let mut store: InodeStore<PassthroughFs> = InodeStore::new();
         let empty_node = Arc::new(OverlayInode::new());
         store.insert_inode(1, empty_node.clone()).await;
         store.insert_inode(2, empty_node.clone()).await;
@@ -186,7 +196,7 @@ mod test {
 
     #[tokio::test]
     async fn test_alloc_existing_path() {
-        let mut store = InodeStore::new();
+        let mut store: InodeStore<PassthroughFs> = InodeStore::new();
         let mut node_a = OverlayInode::new();
         node_a.path = tokio::sync::RwLock::new("/a".to_string());
         store.insert_inode(1, Arc::new(node_a)).await;
