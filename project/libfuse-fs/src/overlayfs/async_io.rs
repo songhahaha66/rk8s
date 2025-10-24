@@ -1,6 +1,6 @@
 use super::Inode;
-use super::{OverlayFs, layer::Layer};
 use super::utils;
+use super::{OverlayFs, layer::Layer};
 use crate::overlayfs::HandleData;
 use crate::overlayfs::RealHandle;
 use crate::overlayfs::{AtomicU64, CachePolicy};

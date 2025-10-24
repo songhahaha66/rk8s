@@ -3604,6 +3604,7 @@ dependencies = [
 name = "libfuse-fs"
 version = "0.1.4"
 dependencies = [
+ "async-trait",
  "bitflags 2.9.4",
  "bytes",
  "clap",

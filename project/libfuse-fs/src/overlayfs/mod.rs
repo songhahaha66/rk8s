@@ -46,9 +46,6 @@ use tokio::sync::{Mutex, RwLock};
 pub type Inode = u64;
 pub type Handle = u64;
 
-
-
-
 // RealInode represents one inode object in specific layer.
 // Also, each RealInode maps to one Entry, which should be 'forgotten' after drop.
 // Important note: do not impl Clone trait for it or refcount will be messed up.
@@ -157,7 +154,7 @@ impl<L: Layer> RealInode<L> {
     }
 
     async fn stat64(&self, req: &Request) -> Result<ReplyAttr> {
-                if self.inode == 0 {
+        if self.inode == 0 {
             return Err(Error::from_raw_os_error(libc::ENOENT));
         }
         // trace!("stat64: trying to getattr req: {:?}", req);
@@ -190,7 +187,7 @@ impl<L: Layer> RealInode<L> {
     ) -> Result<Option<ReplyEntry>> {
         let cname = OsStr::new(name);
         // Real inode must have a layer.
-                match self.layer.lookup(ctx, self.inode, cname).await {
+        match self.layer.lookup(ctx, self.inode, cname).await {
             Ok(v) => {
                 // Negative entry also indicates missing entry.
                 if v.attr.ino == 0 {
@@ -218,16 +215,11 @@ impl<L: Layer> RealInode<L> {
             return Ok(None);
         }
 
-        
         // Find child Entry with <name> under directory with inode <self.inode>.
         match self.lookup_child_ignore_enoent(ctx, name).await? {
             Some(v) => {
                 // The Entry must be forgotten in each layer, which will be done automatically by Drop operation.
-                let (whiteout, opaque) = if v.attr.kind == FileType::Directory {
-                    (false, false)
-                } else {
-                    (false, false)
-                };
+                let (whiteout, opaque) = (false, false);
 
                 Ok(Some(RealInode {
                     layer: self.layer.clone(),
@@ -445,11 +437,7 @@ impl<L: Layer> RealInode<L> {
         let name = OsStr::new(name);
         let entry = self.layer.link(ctx, ino, self.inode, name).await?;
 
-        let opaque = if utils::is_dir(&entry.attr.kind) {
-            false
-        } else {
-            false
-        };
+        let opaque = false;
         Ok(RealInode {
             layer: self.layer.clone(),
             in_upper_layer: true,
@@ -1030,28 +1018,14 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
         // Update upper inode
         if let Some(layer) = self.upper_layer.as_ref() {
             let ino = layer.root_inode();
-            let real = RealInode::new(
-                layer.clone(),
-                true,
-                ino,
-                false,
-                false,
-            )
-            .await;
+            let real = RealInode::new(layer.clone(), true, ino, false, false).await;
             root.real_inodes.lock().await.push(real.into());
         }
 
         // Update lower inodes.
         for layer in self.lower_layers.iter() {
             let ino = layer.root_inode();
-            let real: RealInode<L> = RealInode::new(
-                layer.clone(),
-                false,
-                ino,
-                false,
-                false,
-            )
-            .await;
+            let real: RealInode<L> = RealInode::new(layer.clone(), false, ino, false, false).await;
             root.real_inodes.lock().await.push(real.into());
         }
         let root_node = Arc::new(root);
@@ -1585,32 +1559,32 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
                 // Copy parent node up if necessary.
                 let pnode = self.copy_node_up(ctx, Arc::clone(parent_node)).await?;
                 pnode
-                    .handle_upper_inode_locked(
-                        &mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
-                            let parent_real_inode = match parent_real_inode {
-                                Some(inode) => inode,
-                                None => {
-                                    error!("BUG: parent doesn't have upper inode after copied up");
-                                    return Err(Error::from_raw_os_error(libc::EINVAL));
-                                }
-                            };
-                            let osstr = OsStr::new(name);
-                            if n.in_upper_layer().await {
-                                let _ = parent_real_inode
-                                    .layer
-                                    .delete_whiteout(ctx, parent_real_inode.inode, osstr)
-                                    .await;
+                    .handle_upper_inode_locked(&mut |parent_real_inode: Option<
+                        Arc<RealInode<L>>,
+                    >| async {
+                        let parent_real_inode = match parent_real_inode {
+                            Some(inode) => inode,
+                            None => {
+                                error!("BUG: parent doesn't have upper inode after copied up");
+                                return Err(Error::from_raw_os_error(libc::EINVAL));
                             }
+                        };
+                        let osstr = OsStr::new(name);
+                        if n.in_upper_layer().await {
+                            let _ = parent_real_inode
+                                .layer
+                                .delete_whiteout(ctx, parent_real_inode.inode, osstr)
+                                .await;
+                        }
 
-                            let child_ri = parent_real_inode
-                                .mknod(ctx, name, mode, rdev, umask)
-                                .await?;
+                        let child_ri = parent_real_inode
+                            .mknod(ctx, name, mode, rdev, umask)
+                            .await?;
 
-                            // Replace existing real inodes with new one.
-                            n.add_upper_inode(child_ri, true).await;
-                            Ok(false)
-                        },
-                    )
+                        // Replace existing real inodes with new one.
+                        n.add_upper_inode(child_ri, true).await;
+                        Ok(false)
+                    })
                     .await?;
             }
             None => {
@@ -1619,33 +1593,29 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
                 let new_node = Arc::new(Mutex::new(None));
                 let path = format!("{}/{}", pnode.path.read().await, name);
                 pnode
-                    .handle_upper_inode_locked(
-                        &mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
-                            let parent_real_inode = match parent_real_inode {
-                                Some(inode) => inode,
-                                None => {
-                                    error!("BUG: parent doesn't have upper inode after copied up");
-                                    return Err(Error::from_raw_os_error(libc::EINVAL));
-                                }
-                            };
+                    .handle_upper_inode_locked(&mut |parent_real_inode: Option<
+                        Arc<RealInode<L>>,
+                    >| async {
+                        let parent_real_inode = match parent_real_inode {
+                            Some(inode) => inode,
+                            None => {
+                                error!("BUG: parent doesn't have upper inode after copied up");
+                                return Err(Error::from_raw_os_error(libc::EINVAL));
+                            }
+                        };
 
-                            // Allocate inode number.
-                            let ino = self.alloc_inode(&path).await?;
-                            let child_ri = parent_real_inode
-                                .mknod(ctx, name, mode, rdev, umask)
-                                .await?;
-                            let ovi = OverlayInode::new_from_real_inode(
-                                name,
-                                ino,
-                                path.clone(),
-                                child_ri,
-                            )
-                            .await;
+                        // Allocate inode number.
+                        let ino = self.alloc_inode(&path).await?;
+                        let child_ri = parent_real_inode
+                            .mknod(ctx, name, mode, rdev, umask)
+                            .await?;
+                        let ovi =
+                            OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri)
+                                .await;
 
-                            new_node.lock().await.replace(ovi);
-                            Ok(false)
-                        },
-                    )
+                        new_node.lock().await.replace(ovi);
+                        Ok(false)
+                    })
                     .await?;
 
                 let nn = new_node.lock().await.take();
@@ -1693,33 +1663,33 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
                 // Copy parent node up if necessary.
                 let pnode = self.copy_node_up(ctx, Arc::clone(parent_node)).await?;
                 pnode
-                    .handle_upper_inode_locked(
-                        &mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
-                            let parent_real_inode = match parent_real_inode {
-                                Some(inode) => inode,
-                                None => {
-                                    error!("BUG: parent doesn't have upper inode after copied up");
-                                    return Err(Error::from_raw_os_error(libc::EINVAL));
-                                }
-                            };
-
-                            if n.in_upper_layer().await {
-                                let _ = parent_real_inode
-                                    .layer
-                                    .delete_whiteout(ctx, parent_real_inode.inode, name)
-                                    .await;
+                    .handle_upper_inode_locked(&mut |parent_real_inode: Option<
+                        Arc<RealInode<L>>,
+                    >| async {
+                        let parent_real_inode = match parent_real_inode {
+                            Some(inode) => inode,
+                            None => {
+                                error!("BUG: parent doesn't have upper inode after copied up");
+                                return Err(Error::from_raw_os_error(libc::EINVAL));
                             }
+                        };
 
-                            let (child_ri, hd) =
-                                parent_real_inode.create(ctx, name_str, mode, flags).await?;
-                            real_ino.lock().await.replace(child_ri.inode);
-                            handle.lock().await.replace(hd.unwrap());
+                        if n.in_upper_layer().await {
+                            let _ = parent_real_inode
+                                .layer
+                                .delete_whiteout(ctx, parent_real_inode.inode, name)
+                                .await;
+                        }
 
-                            // Replace existing real inodes with new one.
-                            n.add_upper_inode(child_ri, true).await;
-                            Ok(false)
-                        },
-                    )
+                        let (child_ri, hd) =
+                            parent_real_inode.create(ctx, name_str, mode, flags).await?;
+                        real_ino.lock().await.replace(child_ri.inode);
+                        handle.lock().await.replace(hd.unwrap());
+
+                        // Replace existing real inodes with new one.
+                        n.add_upper_inode(child_ri, true).await;
+                        Ok(false)
+                    })
                     .await?;
                 n.clone()
             }
@@ -1729,34 +1699,34 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
                 let new_node = Arc::new(Mutex::new(None));
                 let path = format!("{}/{}", pnode.path.read().await, name_str);
                 pnode
-                    .handle_upper_inode_locked(
-                        &mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
-                            let parent_real_inode = match parent_real_inode {
-                                Some(inode) => inode,
-                                None => {
-                                    error!("BUG: parent doesn't have upper inode after copied up");
-                                    return Err(Error::from_raw_os_error(libc::EINVAL));
-                                }
-                            };
+                    .handle_upper_inode_locked(&mut |parent_real_inode: Option<
+                        Arc<RealInode<L>>,
+                    >| async {
+                        let parent_real_inode = match parent_real_inode {
+                            Some(inode) => inode,
+                            None => {
+                                error!("BUG: parent doesn't have upper inode after copied up");
+                                return Err(Error::from_raw_os_error(libc::EINVAL));
+                            }
+                        };
 
-                            let (child_ri, hd) =
-                                parent_real_inode.create(ctx, name_str, mode, flags).await?;
-                            real_ino.lock().await.replace(child_ri.inode);
-                            handle.lock().await.replace(hd.unwrap());
-                            // Allocate inode number.
-                            let ino = self.alloc_inode(&path).await?;
-                            let ovi = OverlayInode::new_from_real_inode(
-                                name_str,
-                                ino,
-                                path.clone(),
-                                child_ri,
-                            )
-                            .await;
+                        let (child_ri, hd) =
+                            parent_real_inode.create(ctx, name_str, mode, flags).await?;
+                        real_ino.lock().await.replace(child_ri.inode);
+                        handle.lock().await.replace(hd.unwrap());
+                        // Allocate inode number.
+                        let ino = self.alloc_inode(&path).await?;
+                        let ovi = OverlayInode::new_from_real_inode(
+                            name_str,
+                            ino,
+                            path.clone(),
+                            child_ri,
+                        )
+                        .await;
 
-                            new_node.lock().await.replace(ovi);
-                            Ok(false)
-                        },
-                    )
+                        new_node.lock().await.replace(ovi);
+                        Ok(false)
+                    })
                     .await?;
 
                 // new_node is always 'Some'
@@ -1908,20 +1878,22 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
             // If it is a whiteout, we will overwrite it.
             // First, remove the physical whiteout file in the upper layer.
             new_parent
-                .handle_upper_inode_locked(&mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
-                    let parent_ri = parent_real_inode.ok_or_else(|| {
-                        error!("BUG: parent doesn't have upper inode after copied up");
-                        Error::from_raw_os_error(libc::EINVAL)
-                    })?;
-                    // Only delete if the whiteout is in the upper layer
-                    if existing_node.in_upper_layer().await {
-                        let _ = parent_ri
-                            .layer
-                            .delete_whiteout(ctx, parent_ri.inode, OsStr::new(name))
-                            .await;
-                    }
-                    Ok(false)
-                })
+                .handle_upper_inode_locked(
+                    &mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
+                        let parent_ri = parent_real_inode.ok_or_else(|| {
+                            error!("BUG: parent doesn't have upper inode after copied up");
+                            Error::from_raw_os_error(libc::EINVAL)
+                        })?;
+                        // Only delete if the whiteout is in the upper layer
+                        if existing_node.in_upper_layer().await {
+                            let _ = parent_ri
+                                .layer
+                                .delete_whiteout(ctx, parent_ri.inode, OsStr::new(name))
+                                .await;
+                        }
+                        Ok(false)
+                    },
+                )
                 .await?;
         }
 
@@ -1977,30 +1949,30 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
                 // Copy parent node up if necessary.
                 let pnode = self.copy_node_up(ctx, Arc::clone(parent_node)).await?;
                 pnode
-                    .handle_upper_inode_locked(
-                        &mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
-                            let parent_real_inode = match parent_real_inode {
-                                Some(inode) => inode,
-                                None => {
-                                    error!("BUG: parent doesn't have upper inode after copied up");
-                                    return Err(Error::from_raw_os_error(libc::EINVAL));
-                                }
-                            };
-
-                            if n.in_upper_layer().await {
-                                let _ = parent_real_inode
-                                    .layer
-                                    .delete_whiteout(ctx, parent_real_inode.inode, name_os)
-                                    .await;
+                    .handle_upper_inode_locked(&mut |parent_real_inode: Option<
+                        Arc<RealInode<L>>,
+                    >| async {
+                        let parent_real_inode = match parent_real_inode {
+                            Some(inode) => inode,
+                            None => {
+                                error!("BUG: parent doesn't have upper inode after copied up");
+                                return Err(Error::from_raw_os_error(libc::EINVAL));
                             }
+                        };
 
-                            let child_ri = parent_real_inode.symlink(ctx, linkname, name).await?;
+                        if n.in_upper_layer().await {
+                            let _ = parent_real_inode
+                                .layer
+                                .delete_whiteout(ctx, parent_real_inode.inode, name_os)
+                                .await;
+                        }
 
-                            // Replace existing real inodes with new one.
-                            n.add_upper_inode(child_ri, true).await;
-                            Ok(false)
-                        },
-                    )
+                        let child_ri = parent_real_inode.symlink(ctx, linkname, name).await?;
+
+                        // Replace existing real inodes with new one.
+                        n.add_upper_inode(child_ri, true).await;
+                        Ok(false)
+                    })
                     .await?;
             }
             None => {
@@ -2009,31 +1981,27 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
                 let new_node: Arc<Mutex<Option<OverlayInode<L>>>> = Arc::new(Mutex::new(None));
                 let path = format!("{}/{}", pnode.path.read().await, name);
                 pnode
-                    .handle_upper_inode_locked(
-                        &mut |parent_real_inode: Option<Arc<RealInode<L>>>| async {
-                            let parent_real_inode = match parent_real_inode {
-                                Some(inode) => inode,
-                                None => {
-                                    error!("BUG: parent doesn't have upper inode after copied up");
-                                    return Err(Error::from_raw_os_error(libc::EINVAL));
-                                }
-                            };
+                    .handle_upper_inode_locked(&mut |parent_real_inode: Option<
+                        Arc<RealInode<L>>,
+                    >| async {
+                        let parent_real_inode = match parent_real_inode {
+                            Some(inode) => inode,
+                            None => {
+                                error!("BUG: parent doesn't have upper inode after copied up");
+                                return Err(Error::from_raw_os_error(libc::EINVAL));
+                            }
+                        };
 
-                            // Allocate inode number.
-                            let ino = self.alloc_inode(&path).await?;
-                            let child_ri = parent_real_inode.symlink(ctx, linkname, name).await?;
-                            let ovi = OverlayInode::new_from_real_inode(
-                                name,
-                                ino,
-                                path.clone(),
-                                child_ri,
-                            )
-                            .await;
+                        // Allocate inode number.
+                        let ino = self.alloc_inode(&path).await?;
+                        let child_ri = parent_real_inode.symlink(ctx, linkname, name).await?;
+                        let ovi =
+                            OverlayInode::new_from_real_inode(name, ino, path.clone(), child_ri)
+                                .await;
 
-                            new_node.lock().await.replace(ovi);
-                            Ok(false)
-                        },
-                    )
+                        new_node.lock().await.replace(ovi);
+                        Ok(false)
+                    })
                     .await?;
 
                 // new_node is always 'Some'
@@ -2604,10 +2572,7 @@ impl<L: Layer + Send + Sync + 'static> OverlayFs<L> {
         Ok(())
     }
 
-    async fn find_real_info_from_handle(
-        &self,
-        handle: Handle,
-    ) -> Result<(Arc<L>, Inode, Handle)> {
+    async fn find_real_info_from_handle(&self, handle: Handle) -> Result<(Arc<L>, Inode, Handle)> {
         match self.handles.lock().await.get(&handle) {
             Some(h) => match h.real_handle {
                 Some(ref rhd) => {

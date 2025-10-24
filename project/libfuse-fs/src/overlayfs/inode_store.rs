@@ -159,6 +159,7 @@ impl<L: Layer + Send + Sync> InodeStore<L> {
         self.inode_limit = limit_inode;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.inodes.clear();
         self.deleted.clear();
