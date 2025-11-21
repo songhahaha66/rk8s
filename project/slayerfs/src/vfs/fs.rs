@@ -792,18 +792,7 @@ where
         let (old_dir, old_name) = Self::split_dir_file(&old);
         let (new_dir, new_name) = Self::split_dir_file(&new);
 
-        if self
-            .core
-            .meta_layer
-            .lookup_path(&new)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            return Err("target exists".into());
-        }
-
+        // Resolve old parent and source inode/attributes first
         let old_parent_ino = if &old_dir == "/" {
             self.core.root
         } else {
@@ -816,8 +805,77 @@ where
                 .0
         };
 
+        let src_ino = self
+            .core
+            .meta_layer
+            .lookup(old_parent_ino, &old_name)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not found".to_string())?;
+
+        let src_attr = self
+            .core
+            .meta_layer
+            .stat(src_ino)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "not found".to_string())?;
+
+        // If destination exists, apply replace semantics:
+        // - If dest is file/symlink: unlink it
+        // - If dest is dir: source must be dir and dest must be empty; rmdir it
+        if let Ok(Some((dest_ino, dest_kind))) = self.core.meta_layer.lookup_path(&new).await {
+            // resolve parent directory ino for destination
+            let new_dir_ino = if &new_dir == "/" {
+                self.core.root
+            } else {
+                // parent must exist when destination exists
+                self.core
+                    .meta_layer
+                    .lookup_path(&new_dir)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "parent not found".to_string())?
+                    .0
+            };
+
+            if dest_kind == FileType::Dir {
+                // source must be directory
+                if src_attr.kind != FileType::Dir {
+                    return Err("not a directory".into());
+                }
+
+                // ensure destination dir is empty
+                let children = self
+                    .core
+                    .meta_layer
+                    .readdir(dest_ino)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !children.is_empty() {
+                    return Err("directory not empty".into());
+                }
+
+                // remove the empty destination directory
+                self.core
+                    .meta_layer
+                    .rmdir(new_dir_ino, &new_name)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                // dest is a file or symlink: unlink it to allow replace
+                self.core
+                    .meta_layer
+                    .unlink(new_dir_ino, &new_name)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Ensure destination parent exists (create as needed)
         let new_dir_ino = self.mkdir_p(&new_dir).await?;
 
+        // Perform rename
         self.core
             .meta_layer
             .rename(old_parent_ino, &old_name, new_dir_ino, new_name)
