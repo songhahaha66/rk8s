@@ -745,15 +745,6 @@ where
             return Err(libc::ENOTDIR.into());
         }
 
-        // Ensure destination does not already exist
-        if self
-            .child_of(new_parent as i64, new_name.as_ref())
-            .await
-            .is_some()
-        {
-            return Err(libc::EEXIST.into());
-        }
-
         // Build full paths and perform the rename
         let Some(mut oldp) = self.path_of(parent as i64).await else {
             return Err(libc::ENOENT.into());
@@ -769,13 +760,14 @@ where
             newp.push('/');
         }
         newp.push_str(&new_name);
-        VFS::rename(self, &oldp, &newp).await.map_err(|e| {
-            let code = match e.as_str() {
-                "target exists" => libc::EEXIST,
-                _ => libc::EIO,
-            };
-            code.into()
-        })
+        VFS::rename(self, &oldp, &newp)
+            .await
+            .map_err(|e| match e.as_str() {
+                "target exists" => libc::EEXIST.into(),
+                "directory not empty" => libc::ENOTEMPTY.into(),
+                "not a directory" => libc::ENOTDIR.into(),
+                _ => libc::EIO.into(),
+            })
     }
 
     // ===== Resource release & sync: stateless implementation, return success =====

@@ -863,6 +863,9 @@ where
                     .await
                     .map_err(|e| e.to_string())?;
             } else {
+                if src_attr.kind == FileType::Dir {
+                    return Err("not a directory".into());
+                }
                 // dest is a file or symlink: unlink it to allow replace
                 self.core
                     .meta_layer
