@@ -663,7 +663,7 @@ where
         let Some(cattr) = self.stat_ino(child).await else {
             return Err(libc::ENOENT.into());
         };
-        if !matches!(cattr.kind, VfsFileType::File) {
+        if matches!(cattr.kind, VfsFileType::Dir) {
             return Err(libc::EISDIR.into());
         }
         let Some(mut p) = self.path_of(parent as i64).await else {
