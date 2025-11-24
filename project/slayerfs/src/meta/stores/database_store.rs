@@ -47,7 +47,7 @@ impl DatabaseMetaStore {
 
         let next_inode = AtomicU64::new(Self::init_next_inode(&db).await?);
         let next_slice = AtomicU64::new(Self::init_next_slice(&db).await?);
-        let next_session = AtomicU64::new(Self::init_next_session(&db).await?);
+        let next_session = AtomicU64::new(Self::init_next_session(&db).await? as u64);
         let store = Self {
             db,
             _config,
@@ -71,7 +71,7 @@ impl DatabaseMetaStore {
 
         let next_inode = AtomicU64::new(Self::init_next_inode(&db).await?);
         let next_slice = AtomicU64::new(Self::init_next_slice(&db).await?);
-        let next_session = AtomicU64::new(Self::init_next_session(&db).await?);
+        let next_session = AtomicU64::new(Self::init_next_session(&db).await? as u64);
         let store = Self {
             db,
             _config,
@@ -121,7 +121,7 @@ impl DatabaseMetaStore {
     }
 
     /// Initialize next session ID counter
-    async fn init_next_session(db: &DatabaseConnection) -> Result<u64, MetaError> {
+    async fn init_next_session(db: &DatabaseConnection) -> Result<i64, MetaError> {
         let max_session = SessionMeta::find()
             .order_by_desc(session_meta::Column::Id)
             .one(db)
@@ -1496,7 +1496,7 @@ impl MetaStore for DatabaseMetaStore {
         }
 
         // Create new session
-        let session_id = self.next_id(SESSION_ID_KEY).await? as u64;
+        let session_id = self.next_id(SESSION_ID_KEY).await?;
         let session_model = session_meta::ActiveModel {
             id: Set(session_id),
             session_uuid: Set(session_uuid),
@@ -1615,7 +1615,7 @@ impl MetaStore for DatabaseMetaStore {
         let result: Vec<SessionInfo> = sessions
             .into_iter()
             .map(|s| SessionInfo {
-                id: s.id,
+                id: s.id as u64,
                 info: s.payload,
                 updated_at: SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_millis(s.updated_at as u64),
@@ -1626,7 +1626,7 @@ impl MetaStore for DatabaseMetaStore {
     }
 
     async fn clean_stale_session(&self, session_id: u64) -> Result<(), MetaError> {
-        let session = SessionMeta::find_by_id(session_id)
+        let session = SessionMeta::find_by_id(session_id as i64)
             .one(&self.db)
             .await
             .map_err(MetaError::Database)?;

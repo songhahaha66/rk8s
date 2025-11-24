@@ -6,7 +6,7 @@ use std::time::SystemTime;
 #[sea_orm(table_name = "sessions")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub id: u64,
+    pub id: i64,
 
     /// Session UUID for unique identification
     #[sea_orm(column_type = "Text", unique)]
@@ -47,7 +47,7 @@ impl ActiveModelBehavior for ActiveModel {}
 impl Model {
     /// Create a new session model with current timestamp
     pub fn new(
-        id: u64,
+        id: i64,
         session_uuid: String,
         payload: Vec<u8>,
         hostname: Option<String>,
