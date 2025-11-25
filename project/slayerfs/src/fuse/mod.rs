@@ -145,7 +145,7 @@ where
     }
 
     // Open file: stateless IO, always return fh=0
-    async fn open(&self, _req: Request, ino: u64, _flags: u32) -> FuseResult<ReplyOpen> {
+    async fn open(&self, _req: Request, ino: u64, flags: u32) -> FuseResult<ReplyOpen> {
         // Verify the inode exists and is a file
         let Some(attr) = self.stat_ino(ino as i64).await else {
             return Err(libc::ENOENT.into());
@@ -153,10 +153,18 @@ where
         if matches!(attr.kind, VfsFileType::Dir) {
             return Err(libc::EISDIR.into());
         }
-        Ok(ReplyOpen { fh: 0, flags: 0 })
+
+        let accmode = flags & (libc::O_ACCMODE as u32);
+        let read = accmode != (libc::O_WRONLY as u32);
+        let write = accmode != (libc::O_RDONLY as u32);
+        let fh = self
+            .open_handle(ino as i64, attr.clone(), read, write)
+            .await;
+
+        Ok(ReplyOpen { fh, flags: 0 })
     }
 
-    // Open directory: stateless
+    // Open directory: track handle so getattr(fh) keeps working after unlink/rename
     async fn opendir(&self, _req: Request, ino: u64, _flags: u32) -> FuseResult<ReplyOpen> {
         let Some(attr) = self.stat_ino(ino as i64).await else {
             return Err(libc::ENOENT.into());
@@ -164,7 +172,10 @@ where
         if !matches!(attr.kind, VfsFileType::Dir) {
             return Err(libc::ENOTDIR.into());
         }
-        Ok(ReplyOpen { fh: 0, flags: 0 })
+        let fh = self
+            .open_handle(ino as i64, attr.clone(), false, false)
+            .await;
+        Ok(ReplyOpen { fh, flags: 0 })
     }
 
     // Read file: map to VFS::read (path derived from inode)
@@ -233,12 +244,26 @@ where
         &self,
         req: Request,
         ino: u64,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
-        let Some(vattr) = self.stat_ino(ino as i64).await else {
+        let vattr_opt = self.stat_ino(ino as i64).await;
+        let vattr = if let Some(vattr) = vattr_opt {
+            vattr
+        } else if let Some(fh_value) = fh {
+            let mut fallback_attr = self
+                .handle_attr(fh_value)
+                .await
+                .ok_or_else(|| Errno::from(libc::ENOENT))?;
+            fallback_attr.nlink = 0;
+            fallback_attr
+        } else if let Some(mut fallback_attr) = self.handle_attr_by_ino(ino as i64).await {
+            fallback_attr.nlink = 0;
+            fallback_attr
+        } else {
             return Err(libc::ENOENT.into());
         };
+
         let attr = vfs_to_fuse_attr(&vattr, &req);
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
@@ -775,11 +800,12 @@ where
         &self,
         _req: Request,
         _inode: u64,
-        _fh: u64,
+        fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
     ) -> FuseResult<()> {
+        let _ = self.close_handle(fh).await;
         Ok(())
     }
 
@@ -800,13 +826,8 @@ where
     }
 
     // Close directory handle
-    async fn releasedir(
-        &self,
-        _req: Request,
-        _inode: u64,
-        _fh: u64,
-        _flags: u32,
-    ) -> FuseResult<()> {
+    async fn releasedir(&self, _req: Request, _inode: u64, fh: u64, _flags: u32) -> FuseResult<()> {
+        let _ = self.close_handle(fh).await;
         Ok(())
     }
 

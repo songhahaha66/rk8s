@@ -36,12 +36,12 @@ impl HandleRegistry {
         }
     }
 
-    async fn allocate(&self, ino: i64, flags: HandleFlags) -> u64 {
+    async fn allocate(&self, ino: i64, attr: FileAttr, flags: HandleFlags) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.handles
             .entry(ino)
             .or_default()
-            .push(FileHandle::new(fh, flags));
+            .push(FileHandle::new(fh, ino, attr, flags));
         self.handle_ino.insert(fh, ino);
         fh
     }
@@ -73,6 +73,18 @@ impl HandleRegistry {
             .get(&ino)
             .map(|entry| entry.iter().map(|h| h.fh).collect())
             .unwrap_or_default()
+    }
+
+    async fn attr_for(&self, fh: u64) -> Option<FileAttr> {
+        let ino = *self.handle_ino.get(&fh)?.value();
+        let entry = self.handles.get(&ino)?;
+        entry.iter().find(|h| h.fh == fh).map(|h| h.attr.clone())
+    }
+
+    async fn attr_for_inode(&self, ino: i64) -> Option<FileAttr> {
+        self.handles
+            .get(&ino)
+            .and_then(|entry| entry.iter().next().map(|h| h.attr.clone()))
     }
 }
 
@@ -970,10 +982,10 @@ where
     }
 
     /// Allocate a per-file handle, returning the opaque fh id.
-    pub async fn open_handle(&self, ino: i64, read: bool, write: bool) -> u64 {
+    pub async fn open_handle(&self, ino: i64, attr: FileAttr, read: bool, write: bool) -> u64 {
         self.state
             .handles
-            .allocate(ino, HandleFlags::new(read, write))
+            .allocate(ino, attr, HandleFlags::new(read, write))
             .await
     }
 
@@ -1000,6 +1012,14 @@ where
     /// List all open handles for an inode.
     pub async fn handles_for(&self, ino: i64) -> Vec<u64> {
         self.state.handles.handles_for(ino).await
+    }
+
+    pub async fn handle_attr(&self, fh: u64) -> Option<FileAttr> {
+        self.state.handles.attr_for(fh).await
+    }
+
+    pub async fn handle_attr_by_ino(&self, ino: i64) -> Option<FileAttr> {
+        self.state.handles.attr_for_inode(ino).await
     }
 
     /// Check whether a file has been modified since a given point in time.
