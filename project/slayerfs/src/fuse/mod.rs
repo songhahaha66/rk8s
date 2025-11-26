@@ -16,7 +16,7 @@ pub mod adapter;
 pub mod mount;
 use crate::chuck::store::BlockStore;
 use crate::meta::MetaStore;
-use crate::meta::store::MetaError;
+use crate::meta::store::{MetaError, SetAttrFlags, SetAttrRequest};
 use crate::vfs::fs::{FileAttr as VfsFileAttr, FileType as VfsFileType, VFS};
 use bytes::Bytes;
 use rfuse3::Errno;
@@ -28,7 +28,7 @@ use rfuse3::raw::reply::{
 };
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream};
 use rfuse3::raw::Filesystem;
@@ -108,6 +108,34 @@ mod mount_tests {
         // Explicitly unmount and wait
         if let Err(e) = handle.unmount().await {
             eprintln!("unmount error: {e}");
+        }
+    }
+}
+
+impl<S, M> VFS<S, M>
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaStore + Send + Sync + 'static,
+{
+    async fn apply_new_entry_attrs(
+        &self,
+        ino: i64,
+        uid: u32,
+        gid: u32,
+        mode: Option<u32>,
+    ) -> Option<VfsFileAttr> {
+        let req = SetAttrRequest {
+            uid: Some(uid),
+            gid: Some(gid),
+            mode: mode.map(|bits| bits & 0o777),
+            ..Default::default()
+        };
+        if attr_request_is_empty(&req) {
+            return self.stat_ino(ino).await;
+        }
+        match self.set_attr(ino, &req, SetAttrFlags::empty()).await {
+            Ok(attr) => Some(attr),
+            Err(_err) => self.stat_ino(ino).await,
         }
     }
 }
@@ -271,7 +299,8 @@ where
         })
     }
 
-    // Set attributes: currently only size (truncate) is supported
+    // Set attributes: delegate to metadata layer for mode/uid/gid/size/timestamps.
+    // Permission checks are handled by the kernel (via default_permissions mount option).
     async fn setattr(
         &self,
         req: Request,
@@ -279,16 +308,38 @@ where
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
-        if let Some(size) = set_attr.size {
-            let Some(path) = self.path_of(ino as i64).await else {
+        let (meta_req, meta_flags) = fuse_setattr_to_meta(&set_attr);
+
+        // If no attributes to set, just return current attributes
+        if attr_request_is_empty(&meta_req) && meta_flags.is_empty() {
+            let Some(vattr) = self.stat_ino(ino as i64).await else {
                 return Err(libc::ENOENT.into());
             };
-            self.truncate(&path, size).await.map_err(|_| libc::EIO)?;
+            let attr = vfs_to_fuse_attr(&vattr, &req);
+            return Ok(ReplyAttr {
+                ttl: Duration::from_secs(1),
+                attr,
+            });
         }
-        // Return the refreshed attributes
-        let Some(vattr) = self.stat_ino(ino as i64).await else {
-            return Err(libc::ENOENT.into());
-        };
+
+        // Apply the attribute changes
+        let vattr = self
+            .set_attr(ino as i64, &meta_req, meta_flags)
+            .await
+            .map_err(|e| {
+                let code = match e {
+                    MetaError::NotFound(_) => libc::ENOENT,
+                    MetaError::ParentNotFound(_) => libc::ENOENT,
+                    MetaError::NotDirectory(_) => libc::ENOTDIR,
+                    MetaError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
+                    MetaError::AlreadyExists { .. } => libc::EEXIST,
+                    MetaError::NotSupported(_) | MetaError::NotImplemented => libc::ENOSYS,
+                    MetaError::InvalidPath(_) => libc::EINVAL,
+                    _ => libc::EIO,
+                };
+                Errno::from(code)
+            })?;
+
         let attr = vfs_to_fuse_attr(&vattr, &req);
         Ok(ReplyAttr {
             ttl: Duration::from_secs(1),
@@ -464,8 +515,8 @@ where
         req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
     ) -> FuseResult<ReplyEntry> {
         let name = name.to_string_lossy();
         // Parent must be a directory
@@ -488,7 +539,11 @@ where
         }
         p.push_str(&name);
         let _ino = self.mkdir_p(&p).await.map_err(|_| libc::EIO)?;
-        let Some(vattr) = self.stat_ino(_ino).await else {
+        let masked_mode = (mode & 0o777) & !(umask & 0o777);
+        let Some(vattr) = self
+            .apply_new_entry_attrs(_ino, req.uid, req.gid, Some(masked_mode))
+            .await
+        else {
             return Err(libc::ENOENT.into());
         };
         let attr = vfs_to_fuse_attr(&vattr, &req);
@@ -505,7 +560,7 @@ where
         req: Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
+        mode: u32,
         _flags: u32,
     ) -> FuseResult<ReplyCreated> {
         let name = name.to_string_lossy();
@@ -527,7 +582,10 @@ where
             "is a directory" => libc::EISDIR,
             _ => libc::EIO,
         })?;
-        let Some(vattr) = self.stat_ino(ino).await else {
+        let Some(vattr) = self
+            .apply_new_entry_attrs(ino, req.uid, req.gid, Some(mode & 0o777))
+            .await
+        else {
             return Err(libc::ENOENT.into());
         };
         let attr = vfs_to_fuse_attr(&vattr, &req);
@@ -645,7 +703,7 @@ where
 
         let target = link.to_string_lossy();
 
-        let (_ino, vattr) = self
+        let (ino, vattr) = self
             .create_symlink(&parent_path, target.as_ref())
             .await
             .map_err(|e| -> Errno {
@@ -662,11 +720,14 @@ where
                 code.into()
             })?;
 
-        let attr = vfs_to_fuse_attr(&vattr, &req);
+        let attr = self
+            .apply_new_entry_attrs(ino, req.uid, req.gid, None)
+            .await
+            .unwrap_or(vattr);
 
         Ok(ReplyEntry {
             ttl: Duration::from_secs(1),
-            attr,
+            attr: vfs_to_fuse_attr(&attr, &req),
             generation: 0,
         })
     }
@@ -852,6 +913,57 @@ where
     async fn interrupt(&self, _req: Request, _unique: u64) -> FuseResult<()> {
         Ok(())
     }
+
+    // Check file access permissions
+    async fn access(&self, req: Request, ino: u64, mask: u32) -> FuseResult<()> {
+        let Some(attr) = self.stat_ino(ino as i64).await else {
+            return Err(libc::ENOENT.into());
+        };
+
+        // F_OK (0) just checks for existence
+        if mask == 0 {
+            return Ok(());
+        }
+
+        // Check if the requesting user has the required access
+        let uid = req.uid;
+        let gid = req.gid;
+
+        // Root can access everything (except execute on non-executable files)
+        if uid == 0 {
+            // Root still needs execute permission to be set somewhere
+            if (mask & libc::X_OK as u32) != 0 && (attr.mode & 0o111) == 0 {
+                return Err(libc::EACCES.into());
+            }
+            return Ok(());
+        }
+
+        // Determine which permission bits to check
+        let mode = if uid == attr.uid {
+            // Owner permissions
+            (attr.mode >> 6) & 0o7
+        } else if gid == attr.gid {
+            // Group permissions
+            (attr.mode >> 3) & 0o7
+        } else {
+            // Other permissions
+            attr.mode & 0o7
+        };
+
+        // Check if the requested access is allowed
+        // mask uses libc constants: F_OK=0, X_OK=1, W_OK=2, R_OK=4
+        if (mask & libc::R_OK as u32) != 0 && (mode & 0o4) == 0 {
+            return Err(libc::EACCES.into());
+        }
+        if (mask & libc::W_OK as u32) != 0 && (mode & 0o2) == 0 {
+            return Err(libc::EACCES.into());
+        }
+        if (mask & libc::X_OK as u32) != 0 && (mode & 0o1) == 0 {
+            return Err(libc::EACCES.into());
+        }
+
+        Ok(())
+    }
 }
 
 // =============== helpers ===============
@@ -863,33 +975,80 @@ fn vfs_kind_to_fuse(k: VfsFileType) -> FuseFileType {
     }
 }
 
-fn vfs_to_fuse_attr(v: &VfsFileAttr, req: &Request) -> rfuse3::raw::reply::FileAttr {
-    // Time/permission placeholders: derive mode from kind, timestamps use now
-    let now = Timestamp::from(SystemTime::now());
-    let perm = match v.kind {
-        VfsFileType::Dir => 0o755,
-        VfsFileType::File => 0o644,
-        VfsFileType::Symlink => 0o777,
-    } as u16;
-    // blocks fields expressed in 512B units
+fn vfs_to_fuse_attr(v: &VfsFileAttr, _req: &Request) -> rfuse3::raw::reply::FileAttr {
+    let perm = (v.mode & 0o7777) as u16;
     let blocks = v.size.div_ceil(512);
+    let atime = nanos_to_timestamp(v.atime);
+    let mtime = nanos_to_timestamp(v.mtime);
+    let ctime = nanos_to_timestamp(v.ctime);
     rfuse3::raw::reply::FileAttr {
         ino: v.ino as u64,
         size: v.size,
         blocks,
-        atime: now,
-        mtime: now,
-        ctime: now,
+        atime,
+        mtime,
+        ctime,
         #[cfg(target_os = "macos")]
-        crtime: now,
+        crtime: ctime,
         kind: vfs_kind_to_fuse(v.kind),
         perm,
         nlink: v.nlink,
-        uid: req.uid,
-        gid: req.gid,
+        uid: v.uid,
+        gid: v.gid,
         rdev: 0,
         #[cfg(target_os = "macos")]
         flags: 0,
         blksize: 4096,
     }
+}
+
+const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+fn nanos_to_timestamp(value: i64) -> Timestamp {
+    let sec = value.div_euclid(NANOS_PER_SEC);
+    let nsec = value.rem_euclid(NANOS_PER_SEC) as u32;
+    Timestamp::new(sec, nsec)
+}
+
+fn timestamp_to_nanos(ts: Timestamp) -> i64 {
+    ts.sec
+        .saturating_mul(NANOS_PER_SEC)
+        .saturating_add(ts.nsec as i64)
+}
+fn fuse_setattr_to_meta(set_attr: &SetAttr) -> (SetAttrRequest, SetAttrFlags) {
+    let mut req = SetAttrRequest::default();
+    let flags = SetAttrFlags::empty();
+    if let Some(mode) = set_attr.mode {
+        req.mode = Some(mode);
+    }
+    if let Some(uid) = set_attr.uid {
+        req.uid = Some(uid);
+    }
+    if let Some(gid) = set_attr.gid {
+        req.gid = Some(gid);
+    }
+    if let Some(size) = set_attr.size {
+        req.size = Some(size);
+    }
+    if let Some(atime) = set_attr.atime {
+        req.atime = Some(timestamp_to_nanos(atime));
+    }
+    if let Some(mtime) = set_attr.mtime {
+        req.mtime = Some(timestamp_to_nanos(mtime));
+    }
+    if let Some(ctime) = set_attr.ctime {
+        req.ctime = Some(timestamp_to_nanos(ctime));
+    }
+    (req, flags)
+}
+
+fn attr_request_is_empty(req: &SetAttrRequest) -> bool {
+    req.mode.is_none()
+        && req.uid.is_none()
+        && req.gid.is_none()
+        && req.size.is_none()
+        && req.atime.is_none()
+        && req.mtime.is_none()
+        && req.ctime.is_none()
+        && req.flags.is_none()
 }

@@ -1046,12 +1046,16 @@ impl MetaStore for DatabaseMetaStore {
     ) -> Result<FileAttr, MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
-        if let Some(mut file) = FileMeta::find_by_id(ino)
+        if let Some(file) = FileMeta::find_by_id(ino)
             .one(&txn)
             .await
             .map_err(MetaError::Database)?
         {
             let mut permission = file.permission().clone();
+            let mut size = file.size;
+            let mut access_time = file.access_time;
+            let mut modify_time = file.modify_time;
+            let mut create_time = file.create_time;
             let mut ctime_update = false;
             let now = Self::now_nanos();
 
@@ -1082,45 +1086,68 @@ impl MetaStore for DatabaseMetaStore {
                 ctime_update = true;
             }
 
-            file.permission = permission;
-
-            if let Some(size) = req.size {
-                let new_size = size as i64;
-                if file.size != new_size {
-                    file.size = new_size;
-                    file.modify_time = now;
+            if let Some(size_req) = req.size {
+                let new_size = size_req as i64;
+                if size != new_size {
+                    size = new_size;
+                    modify_time = now;
                 }
                 ctime_update = true;
             }
 
             if flags.contains(SetAttrFlags::SET_ATIME_NOW) {
-                file.access_time = now;
+                access_time = now;
             } else if let Some(atime) = req.atime {
-                file.access_time = atime;
+                access_time = atime;
             }
 
             if flags.contains(SetAttrFlags::SET_MTIME_NOW) {
-                file.modify_time = now;
+                modify_time = now;
                 ctime_update = true;
             } else if let Some(mtime) = req.mtime {
-                file.modify_time = mtime;
+                modify_time = mtime;
                 ctime_update = true;
             }
 
             if let Some(ctime) = req.ctime {
-                file.create_time = ctime;
+                create_time = ctime;
             } else if ctime_update {
-                file.create_time = now;
+                create_time = now;
             }
 
-            let active: file_meta::ActiveModel = file.into();
+            let kind = if file.symlink_target.is_some() {
+                FileType::Symlink
+            } else {
+                FileType::File
+            };
+            let nlink = file.nlink;
+            let symlink_len = file.symlink_target.as_ref().map(|t| t.len() as u64);
+
+            let mut active: file_meta::ActiveModel = file.into();
+            active.permission = Set(permission.clone());
+            active.size = Set(size);
+            active.access_time = Set(access_time);
+            active.modify_time = Set(modify_time);
+            active.create_time = Set(create_time);
             active.update(&txn).await.map_err(MetaError::Database)?;
 
             txn.commit().await.map_err(MetaError::Database)?;
-            return self.stat(ino).await?.ok_or(MetaError::NotFound(ino));
+            let out = FileAttr {
+                ino,
+                size: symlink_len.unwrap_or(size as u64),
+                kind,
+                mode: permission.mode,
+                uid: permission.uid,
+                gid: permission.gid,
+                atime: access_time,
+                mtime: modify_time,
+                ctime: create_time,
+                nlink: nlink as u32,
+            };
+            return Ok(out);
         }
 
-        if let Some(mut dir) = AccessMeta::find_by_id(ino)
+        if let Some(dir) = AccessMeta::find_by_id(ino)
             .one(&txn)
             .await
             .map_err(MetaError::Database)?
@@ -1128,6 +1155,9 @@ impl MetaStore for DatabaseMetaStore {
             let mut permission = dir.permission().clone();
             let mut ctime_update = false;
             let now = Self::now_nanos();
+            let mut access_time = dir.access_time;
+            let mut modify_time = dir.modify_time;
+            let mut create_time = dir.create_time;
 
             if let Some(mode) = req.mode {
                 permission.chmod(mode);
@@ -1156,29 +1186,31 @@ impl MetaStore for DatabaseMetaStore {
                 ctime_update = true;
             }
 
-            dir.permission = permission;
-
             if flags.contains(SetAttrFlags::SET_ATIME_NOW) {
-                dir.access_time = now;
+                access_time = now;
             } else if let Some(atime) = req.atime {
-                dir.access_time = atime;
+                access_time = atime;
             }
 
             if flags.contains(SetAttrFlags::SET_MTIME_NOW) {
-                dir.modify_time = now;
+                modify_time = now;
                 ctime_update = true;
             } else if let Some(mtime) = req.mtime {
-                dir.modify_time = mtime;
+                modify_time = mtime;
                 ctime_update = true;
             }
 
             if let Some(ctime) = req.ctime {
-                dir.create_time = ctime;
+                create_time = ctime;
             } else if ctime_update {
-                dir.create_time = now;
+                create_time = now;
             }
 
-            let active: access_meta::ActiveModel = dir.into();
+            let mut active: access_meta::ActiveModel = dir.into();
+            active.permission = Set(permission);
+            active.access_time = Set(access_time);
+            active.modify_time = Set(modify_time);
+            active.create_time = Set(create_time);
             active.update(&txn).await.map_err(MetaError::Database)?;
 
             txn.commit().await.map_err(MetaError::Database)?;
@@ -1267,10 +1299,27 @@ impl MetaStore for DatabaseMetaStore {
         {
             dir.access_time = Self::now_nanos();
             let active: access_meta::ActiveModel = dir.into();
+            let out_perm = active.permission.clone().unwrap();
+            let out_atime = active.access_time.clone().unwrap();
+            let out_mtime = active.modify_time.clone().unwrap();
+            let out_ctime = active.create_time.clone().unwrap();
+            let out_nlink = active.nlink.clone().unwrap();
             active.update(&txn).await.map_err(MetaError::Database)?;
 
             txn.commit().await.map_err(MetaError::Database)?;
-            return self.stat(ino).await?.ok_or(MetaError::NotFound(ino));
+            let out = FileAttr {
+                ino,
+                size: 4096,
+                kind: FileType::Dir,
+                mode: out_perm.mode,
+                uid: out_perm.uid,
+                gid: out_perm.gid,
+                atime: out_atime,
+                mtime: out_mtime,
+                ctime: out_ctime,
+                nlink: out_nlink as u32,
+            };
+            return Ok(out);
         }
 
         txn.rollback().await.map_err(MetaError::Database)?;

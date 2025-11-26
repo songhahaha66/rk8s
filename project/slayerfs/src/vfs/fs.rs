@@ -6,7 +6,7 @@ use crate::chuck::store::BlockStore;
 use crate::chuck::writer::ChunkWriter;
 use crate::meta::client::{MetaClient, MetaClientOptions};
 use crate::meta::config::{CacheCapacity, CacheTtl};
-use crate::meta::store::MetaError;
+use crate::meta::store::{MetaError, SetAttrFlags, SetAttrRequest};
 use crate::meta::{MetaLayer, MetaStore};
 use dashmap::{DashMap, Entry};
 use std::collections::HashMap;
@@ -85,6 +85,14 @@ impl HandleRegistry {
         self.handles
             .get(&ino)
             .and_then(|entry| entry.iter().next().map(|h| h.attr.clone()))
+    }
+
+    async fn update_attr_for_inode(&self, ino: i64, attr: &FileAttr) {
+        if let Some(mut entry) = self.handles.get_mut(&ino) {
+            for handle in entry.iter_mut() {
+                handle.attr = attr.clone();
+            }
+        }
     }
 }
 
@@ -913,6 +921,26 @@ where
             .map_err(|e| e.to_string())?;
         self.state.modified.touch(ino).await;
         Ok(())
+    }
+
+    pub async fn set_attr(
+        &self,
+        ino: i64,
+        req: &SetAttrRequest,
+        flags: SetAttrFlags,
+    ) -> Result<FileAttr, MetaError> {
+        let attr = self.core.meta_layer.set_attr(ino, req, flags).await?;
+
+        if let Some(size) = req.size
+            && let Some(inode) = self.state.files.inode(ino)
+        {
+            inode.update_size(size);
+        }
+
+        self.state.modified.touch(ino).await;
+        self.state.handles.update_attr_for_inode(ino, &attr).await;
+
+        Ok(attr)
     }
 
     /// Write data by file offset. Internally splits the range into per-chunk writes.

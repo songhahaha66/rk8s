@@ -972,7 +972,11 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     ) -> Result<FileAttr, MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
-        self.store.set_attr(inode, req, flags).await
+        let attr = self.store.set_attr(inode, req, flags).await?;
+        self.inode_cache
+            .insert_node(inode, attr.clone(), None)
+            .await;
+        Ok(attr)
     }
 
     async fn open(&self, ino: i64, flags: OpenFlags) -> Result<FileAttr, MetaError> {
