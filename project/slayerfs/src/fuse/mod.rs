@@ -224,6 +224,10 @@ where
             .read_ino(ino as i64, offset, size as usize)
             .await
             .map_err(|_| libc::EIO)?;
+
+        // Update atime after successful read
+        let _ = self.update_atime(ino as i64).await;
+
         Ok(ReplyData {
             data: Bytes::from(data),
         })
@@ -240,6 +244,9 @@ where
             };
             code.into()
         })?;
+
+        // Update atime after successful readlink
+        let _ = self.update_atime(ino as i64).await;
 
         Ok(ReplyData {
             data: Bytes::copy_from_slice(target.as_bytes()),
@@ -366,6 +373,9 @@ where
             Some(v) => v,
         };
 
+        // Update atime after successful readdir
+        let _ = self.update_atime(ino as i64).await;
+
         // Assemble entries including '.' and '..'; offsets reference the previous entry so start at offset+1
         let mut all: Vec<DirectoryEntry> = Vec::with_capacity(entries.len() + 2);
         // "."
@@ -424,6 +434,9 @@ where
             }
             Some(v) => v,
         };
+
+        // Update atime after successful readdirplus
+        let _ = self.update_atime(ino as i64).await;
 
         let ttl = Duration::from_secs(1);
 

@@ -359,6 +359,35 @@ where
         self.core.meta_layer.stat(ino).await.ok().flatten()
     }
 
+    /// Update atime (access time) for an inode to current time
+    pub async fn update_atime(&self, ino: i64) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("time error: {}", e))?
+            .as_nanos() as i64;
+
+        let req = SetAttrRequest {
+            atime: Some(now),
+            ..Default::default()
+        };
+
+        self.core
+            .meta_layer
+            .set_attr(ino, &req, SetAttrFlags::empty())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Update handle cache if exists
+        if let Some(mut attr) = self.state.handles.attr_for_inode(ino).await {
+            attr.atime = now;
+            self.state.handles.update_attr_for_inode(ino, &attr).await;
+        }
+
+        Ok(())
+    }
+
     /// List directory entries by inode
     pub async fn readdir_ino(&self, ino: i64) -> Option<Vec<DirEntry>> {
         let meta_entries = self.core.meta_layer.readdir(ino).await.ok()?;

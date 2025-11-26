@@ -75,7 +75,7 @@ mkdir -p "\$BACKEND_DIR" "\$MOUNT_DIR"
   -c "\$CONFIG_PATH" \
   -s "\$BACKEND_DIR" \
   -m "\$MOUNT_DIR" >>"\$LOG_FILE" 2>&1 &
-
+sleep 1
 EOF
 sudo chmod +x /usr/sbin/mount.fuse.slayerfs
 
