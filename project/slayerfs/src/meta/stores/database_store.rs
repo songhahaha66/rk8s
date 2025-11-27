@@ -1097,8 +1097,10 @@ impl MetaStore for DatabaseMetaStore {
 
             if flags.contains(SetAttrFlags::SET_ATIME_NOW) {
                 access_time = now;
+                ctime_update = true;
             } else if let Some(atime) = req.atime {
                 access_time = atime;
+                ctime_update = true;
             }
 
             if flags.contains(SetAttrFlags::SET_MTIME_NOW) {
@@ -1188,8 +1190,10 @@ impl MetaStore for DatabaseMetaStore {
 
             if flags.contains(SetAttrFlags::SET_ATIME_NOW) {
                 access_time = now;
+                ctime_update = true;
             } else if let Some(atime) = req.atime {
                 access_time = atime;
+                ctime_update = true;
             }
 
             if flags.contains(SetAttrFlags::SET_MTIME_NOW) {
