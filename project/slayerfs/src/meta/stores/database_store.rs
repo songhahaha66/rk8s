@@ -976,7 +976,7 @@ impl MetaStore for DatabaseMetaStore {
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-        // Update old parent mtime
+        // Update old parent mtime and ctime
         let mut old_parent_meta: access_meta::ActiveModel = AccessMeta::find_by_id(old_parent)
             .one(&txn)
             .await
@@ -984,12 +984,13 @@ impl MetaStore for DatabaseMetaStore {
             .ok_or(MetaError::ParentNotFound(old_parent))?
             .into();
         old_parent_meta.modify_time = Set(now);
+        old_parent_meta.create_time = Set(now);
         old_parent_meta
             .update(&txn)
             .await
             .map_err(MetaError::Database)?;
 
-        // Update new parent mtime (if different)
+        // Update new parent mtime and ctime (if different)
         if old_parent != new_parent {
             let mut new_parent_meta: access_meta::ActiveModel = AccessMeta::find_by_id(new_parent)
                 .one(&txn)
@@ -998,6 +999,7 @@ impl MetaStore for DatabaseMetaStore {
                 .ok_or(MetaError::NotFound(new_parent))?
                 .into();
             new_parent_meta.modify_time = Set(now);
+            new_parent_meta.create_time = Set(now);
             new_parent_meta
                 .update(&txn)
                 .await

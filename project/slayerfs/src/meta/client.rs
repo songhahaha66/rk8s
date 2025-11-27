@@ -947,6 +947,12 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             self.invalidate_parent_path(new_parent).await;
         }
 
+        // Invalidate parent directory stat caches since their mtime/ctime changed
+        self.inode_cache.invalidate_inode(old_parent).await;
+        if old_parent != new_parent {
+            self.inode_cache.invalidate_inode(new_parent).await;
+        }
+
         Ok(())
     }
 
