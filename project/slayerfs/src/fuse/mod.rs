@@ -33,6 +33,8 @@ use std::time::Duration;
 use futures_util::stream::{self, BoxStream};
 use rfuse3::raw::Filesystem;
 use rfuse3::{FileType as FuseFileType, SetAttr, Timestamp};
+use tracing::error;
+
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests {
     use super::*;
@@ -884,18 +886,29 @@ where
     }
 
     // Flush file (close path callback)
-    async fn flush(
-        &self,
-        _req: Request,
-        _inode: u64,
-        _fh: u64,
-        _lock_owner: u64,
-    ) -> FuseResult<()> {
+    async fn flush(&self, _req: Request, inode: u64, _fh: u64, _lock_owner: u64) -> FuseResult<()> {
+        // Update mtime/ctime for files that may have been modified via mmap
+        // The kernel doesn't call write() for mmap writes, so we update timestamps here
+        let ino = inode as i64;
+        if let Err(e) = self.update_timestamps_on_flush(ino).await {
+            error!(
+                "Failed to update timestamps on flush for inode {}: {}",
+                ino, e
+            );
+        }
         Ok(())
     }
 
     // Sync file content to backend
-    async fn fsync(&self, _req: Request, _inode: u64, _fh: u64, _datasync: bool) -> FuseResult<()> {
+    async fn fsync(&self, _req: Request, inode: u64, _fh: u64, _datasync: bool) -> FuseResult<()> {
+        // Update mtime/ctime for files that may have been modified via mmap
+        let ino = inode as i64;
+        if let Err(e) = self.update_timestamps_on_flush(ino).await {
+            error!(
+                "Failed to update timestamps on fsync for inode {}: {}",
+                ino, e
+            );
+        }
         Ok(())
     }
 

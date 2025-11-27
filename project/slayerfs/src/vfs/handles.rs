@@ -29,8 +29,8 @@ impl FileHandle {
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct HandleFlags {
-    read: bool,
-    write: bool,
+    pub read: bool,
+    pub write: bool,
 }
 
 impl HandleFlags {

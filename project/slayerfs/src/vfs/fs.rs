@@ -94,6 +94,14 @@ impl HandleRegistry {
             }
         }
     }
+
+    /// Check if any handle for this inode was opened for writing
+    async fn has_write_handle(&self, ino: i64) -> bool {
+        self.handles
+            .get(&ino)
+            .map(|entry| entry.iter().any(|h| h.flags.write))
+            .unwrap_or(false)
+    }
 }
 
 struct ModifiedTracker {
@@ -382,6 +390,39 @@ where
         // Update handle cache if exists
         if let Some(mut attr) = self.state.handles.attr_for_inode(ino).await {
             attr.atime = now;
+            self.state.handles.update_attr_for_inode(ino, &attr).await;
+        }
+
+        Ok(())
+    }
+
+    /// Update mtime and ctime for an inode to current time
+    /// This is called during flush/fsync to handle mmap writes where the kernel
+    /// doesn't call the write() callback
+    pub async fn update_mtime_ctime(&self, ino: i64) -> Result<(), String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("time error: {}", e))?
+            .as_nanos() as i64;
+
+        let req = SetAttrRequest {
+            mtime: Some(now),
+            ctime: Some(now),
+            ..Default::default()
+        };
+
+        self.core
+            .meta_layer
+            .set_attr(ino, &req, SetAttrFlags::empty())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Update handle cache if exists
+        if let Some(mut attr) = self.state.handles.attr_for_inode(ino).await {
+            attr.mtime = now;
+            attr.ctime = now;
             self.state.handles.update_attr_for_inode(ino, &attr).await;
         }
 
@@ -1087,6 +1128,21 @@ where
     /// Drop modification markers older than `ttl` to keep the tracker bounded.
     pub async fn cleanup_modified(&self, ttl: Duration) {
         self.state.modified.cleanup_older_than(ttl).await;
+    }
+
+    /// Update timestamps on flush/fsync for files that may have been modified via mmap.
+    /// This is necessary because the kernel doesn't call write() for mmap writes.
+    /// We only update if the file was opened for writing.
+    pub async fn update_timestamps_on_flush(&self, ino: i64) -> Result<(), String> {
+        // Check if any handle for this inode was opened for writing
+        let has_write_handle = self.state.handles.has_write_handle(ino).await;
+
+        if has_write_handle {
+            // File was opened for writing, update mtime/ctime to handle potential mmap writes
+            self.update_mtime_ctime(ino).await?;
+        }
+
+        Ok(())
     }
 
     async fn ensure_inode_registered(&self, ino: i64) -> Result<Arc<Inode>, String> {
