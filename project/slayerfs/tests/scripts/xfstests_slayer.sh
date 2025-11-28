@@ -80,6 +80,9 @@ EOF
 sudo chmod +x /usr/sbin/mount.fuse.slayerfs
 
 echo "====> Start to run xfstests."
+# Copy exclude list
+sudo cp "$current_dir/xfstests_slayer.exclude" /tmp/xfstests-dev/
+
 # run tests.
 cd /tmp/xfstests-dev
-# sudo LC_ALL=C ./check -fuse
+sudo LC_ALL=C ./check -fuse -E xfstests_slayer.exclude
