@@ -282,15 +282,16 @@ impl DatabaseMetaStore {
         // Start transaction
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
-        if AccessMeta::find_by_id(parent_inode)
+        let parent_meta = AccessMeta::find_by_id(parent_inode)
             .one(&txn)
             .await
-            .map_err(MetaError::Database)?
-            .is_none()
-        {
+            .map_err(MetaError::Database)?;
+
+        if parent_meta.is_none() {
             txn.rollback().await.map_err(MetaError::Database)?;
             return Err(MetaError::ParentNotFound(parent_inode));
         }
+        let parent_meta = parent_meta.unwrap();
 
         // Check if entry already exists
         let existing = ContentMeta::find()
@@ -311,7 +312,24 @@ impl DatabaseMetaStore {
         let inode = self.generate_id();
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let dir_permission = Permission::new(0o40755, 0, 0);
+
+        // Inherit gid from parent if parent has setgid bit set
+        let parent_perm = parent_meta.permission();
+        let parent_has_setgid = (parent_perm.mode & 0o2000) != 0;
+        let gid = if parent_has_setgid {
+            parent_perm.gid
+        } else {
+            0
+        };
+
+        // Directories inherit setgid bit from parent
+        let mode = if parent_has_setgid {
+            0o42755 // Directory with setgid bit
+        } else {
+            0o40755 // Regular directory
+        };
+
+        let dir_permission = Permission::new(mode, 0, gid);
         let access_meta = access_meta::ActiveModel {
             inode: Set(inode),
             permission: Set(dir_permission),
@@ -365,15 +383,16 @@ impl DatabaseMetaStore {
         // Start transaction
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
 
-        if AccessMeta::find_by_id(parent_inode)
+        let parent_meta = AccessMeta::find_by_id(parent_inode)
             .one(&txn)
             .await
-            .map_err(MetaError::Database)?
-            .is_none()
-        {
+            .map_err(MetaError::Database)?;
+
+        if parent_meta.is_none() {
             txn.rollback().await.map_err(MetaError::Database)?;
             return Err(MetaError::ParentNotFound(parent_inode));
         }
+        let parent_meta = parent_meta.unwrap();
 
         // Check if entry already exists
         let existing = ContentMeta::find()
@@ -394,7 +413,17 @@ impl DatabaseMetaStore {
         let inode = self.generate_id();
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let file_permission = Permission::new(0o644, 0, 0);
+
+        // Inherit gid from parent if parent has setgid bit set
+        let parent_perm = parent_meta.permission();
+        let parent_has_setgid = (parent_perm.mode & 0o2000) != 0;
+        let gid = if parent_has_setgid {
+            parent_perm.gid
+        } else {
+            0
+        };
+
+        let file_permission = Permission::new(0o100644, 0, gid);
         let file_meta = file_meta::ActiveModel {
             inode: Set(inode),
             size: Set(0),

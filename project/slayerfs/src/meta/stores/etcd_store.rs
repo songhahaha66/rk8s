@@ -333,10 +333,12 @@ impl EtcdMetaStore {
 
     /// Create a new directory
     async fn create_directory(&self, parent_inode: i64, name: String) -> Result<i64, MetaError> {
-        // Step 1: Verify parent exists
-        if self.get_access_meta(parent_inode).await?.is_none() {
+        // Step 1: Verify parent exists and get its metadata
+        let parent_meta = self.get_access_meta(parent_inode).await?;
+        if parent_meta.is_none() {
             return Err(MetaError::ParentNotFound(parent_inode));
         }
+        let parent_meta = parent_meta.unwrap();
 
         if let Some(contents) = self.get_content_meta(parent_inode).await? {
             for content in contents {
@@ -352,7 +354,24 @@ impl EtcdMetaStore {
         let inode = self.generate_id(INODE_ID_KEY).await?;
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let dir_permission = Permission::new(0o40755, 0, 0);
+
+        // Inherit gid from parent if parent has setgid bit set
+        let parent_perm = &parent_meta.permission;
+        let parent_has_setgid = (parent_perm.mode & 0o2000) != 0;
+        let gid = if parent_has_setgid {
+            parent_perm.gid
+        } else {
+            0
+        };
+
+        // Directories inherit setgid bit from parent
+        let mode = if parent_has_setgid {
+            0o42755 // Directory with setgid bit
+        } else {
+            0o40755 // Regular directory
+        };
+
+        let dir_permission = Permission::new(mode, 0, gid);
         let entry_info = EtcdEntryInfo {
             is_file: false,
             size: None,
@@ -459,10 +478,12 @@ impl EtcdMetaStore {
         parent_inode: i64,
         name: String,
     ) -> Result<i64, MetaError> {
-        // Step 1: Verify parent exists
-        if self.get_access_meta(parent_inode).await?.is_none() {
+        // Step 1: Verify parent exists and get its metadata
+        let parent_meta = self.get_access_meta(parent_inode).await?;
+        if parent_meta.is_none() {
             return Err(MetaError::ParentNotFound(parent_inode));
         }
+        let parent_meta = parent_meta.unwrap();
 
         if let Some(contents) = self.get_content_meta(parent_inode).await? {
             for content in contents {
@@ -478,7 +499,17 @@ impl EtcdMetaStore {
         let inode = self.generate_id(INODE_ID_KEY).await?;
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let file_permission = Permission::new(0o644, 0, 0);
+
+        // Inherit gid from parent if parent has setgid bit set
+        let parent_perm = &parent_meta.permission;
+        let parent_has_setgid = (parent_perm.mode & 0o2000) != 0;
+        let gid = if parent_has_setgid {
+            parent_perm.gid
+        } else {
+            0
+        };
+
+        let file_permission = Permission::new(0o100644, 0, gid);
         let entry_info = EtcdEntryInfo {
             is_file: true,
             size: Some(0),

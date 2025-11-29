@@ -261,7 +261,20 @@ impl RedisMetaStore {
             return Err(MetaError::AlreadyExists { parent, name });
         }
         let ino = self.alloc_id(INODE_ID_KEY).await?;
-        let node = StoredNode::new(ino, parent, name.clone(), kind);
+        let mut node = StoredNode::new(ino, parent, name.clone(), kind);
+
+        // Inherit gid and setgid bit from parent if parent has setgid bit set
+        if let Some(parent_node) = self.get_node(parent).await? {
+            let parent_has_setgid = (parent_node.attr.mode & 0o2000) != 0;
+            if parent_has_setgid {
+                node.attr.gid = parent_node.attr.gid;
+                // Directories inherit setgid bit from parent
+                if matches!(kind, FileType::Dir) {
+                    node.attr.mode |= 0o2000;
+                }
+            }
+        }
+
         self.save_node(&node).await?;
         self.add_dir_entry(parent, &name, ino).await?;
         if matches!(kind, FileType::Dir) {
