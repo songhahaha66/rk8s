@@ -12,6 +12,8 @@ use slayerfs::vfs::fs::VFS;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
+#[cfg(target_os = "linux")]
+use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -220,16 +222,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("Press Ctrl+C to exit and unmount filesystem...");
 
-        tokio::select! {
-            _ = signal::ctrl_c() => {
-                println!("\nUnmounting filesystem...");
+        // Wait for either SIGINT (Ctrl+C) or SIGTERM (e.g. external umount/kill)
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let reason = tokio::select! {
+            _ = signal::ctrl_c() => "SIGINT/Ctrl+C",
+            _ = sigterm.recv() => "SIGTERM",
+        };
 
-                handle.unmount().await?;
-                println!("Filesystem unmounted");
-                gc_handle.abort();
-                let _ = gc_handle.await;
-            }
-        }
+        println!("\nUnmounting filesystem ({reason})...");
+
+        handle.unmount().await?;
+        println!("Filesystem unmounted");
+
+        // Stop GC task
+        gc_handle.abort();
+        let _ = gc_handle.await;
 
         Ok(())
     }
