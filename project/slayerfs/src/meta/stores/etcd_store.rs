@@ -8,7 +8,7 @@ use crate::meta::backoff::backoff;
 use crate::meta::config::{Config, DatabaseType};
 use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
-use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
+use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore, SetAttrFlags, SetAttrRequest};
 use crate::meta::stores::pool::IdPool;
 use crate::meta::{INODE_ID_KEY, Permission, SESSION_ID_KEY};
 use crate::vfs::fs::FileType;
@@ -2084,6 +2084,193 @@ impl MetaStore for EtcdMetaStore {
             // Session not found, nothing to clean
             Ok(())
         }
+    }
+
+    async fn set_attr(
+        &self,
+        ino: i64,
+        req: &SetAttrRequest,
+        flags: SetAttrFlags,
+    ) -> Result<FileAttr, MetaError> {
+        let reverse_key = Self::etcd_reverse_key(ino);
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        // Retry loop for optimistic locking using etcd's mod_revision
+        let max_retries = 10;
+        for retry in 0..max_retries {
+            let mut client = self.client.clone();
+
+            // Get current entry info with revision for CAS
+            let get_resp = client.get(reverse_key.as_str(), None).await.map_err(|e| {
+                MetaError::Internal(format!("Failed to get key {}: {}", reverse_key, e))
+            })?;
+
+            let kv = get_resp.kvs().first().ok_or(MetaError::NotFound(ino))?;
+            let mod_revision = kv.mod_revision();
+
+            let mut entry_info: EtcdEntryInfo =
+                serde_json::from_slice(kv.value()).map_err(|e| {
+                    MetaError::Internal(format!("Failed to deserialize entry info: {}", e))
+                })?;
+
+            let mut ctime_update = false;
+
+            // Apply permission changes
+            if let Some(mode) = req.mode {
+                entry_info.permission.chmod(mode);
+                ctime_update = true;
+            }
+
+            if let Some(uid) = req.uid {
+                let gid = req.gid.unwrap_or(entry_info.permission.gid);
+                entry_info.permission.chown(uid, gid);
+                ctime_update = true;
+            }
+
+            if req.uid.is_none()
+                && let Some(gid) = req.gid
+            {
+                entry_info.permission.chown(entry_info.permission.uid, gid);
+                ctime_update = true;
+            }
+
+            // Clear suid/sgid flags
+            if flags.contains(SetAttrFlags::CLEAR_SUID) {
+                entry_info.permission.mode &= !0o4000;
+                ctime_update = true;
+            }
+            if flags.contains(SetAttrFlags::CLEAR_SGID) {
+                entry_info.permission.mode &= !0o2000;
+                ctime_update = true;
+            }
+
+            // Apply size changes (files only)
+            if entry_info.is_file
+                && let Some(size_req) = req.size
+            {
+                let new_size = size_req as i64;
+                if entry_info.size != Some(new_size) {
+                    entry_info.size = Some(new_size);
+                    entry_info.modify_time = now;
+                }
+                ctime_update = true;
+            }
+
+            // Apply time changes
+            if flags.contains(SetAttrFlags::SET_ATIME_NOW) {
+                entry_info.access_time = now;
+                ctime_update = true;
+            } else if let Some(atime) = req.atime {
+                entry_info.access_time = atime;
+                ctime_update = true;
+            }
+
+            if flags.contains(SetAttrFlags::SET_MTIME_NOW) {
+                entry_info.modify_time = now;
+                ctime_update = true;
+            } else if let Some(mtime) = req.mtime {
+                entry_info.modify_time = mtime;
+                ctime_update = true;
+            }
+
+            if let Some(ctime) = req.ctime {
+                entry_info.create_time = ctime;
+            } else if ctime_update {
+                entry_info.create_time = now;
+            }
+
+            // Attempt atomic update using mod_revision for precise CAS
+            let txn = Txn::new()
+                .when(vec![Compare::mod_revision(
+                    reverse_key.as_bytes(),
+                    CompareOp::Equal,
+                    mod_revision,
+                )])
+                .and_then(vec![TxnOp::put(
+                    reverse_key.as_bytes(),
+                    serde_json::to_vec(&entry_info).map_err(|e| {
+                        MetaError::Internal(format!("Failed to serialize entry info: {}", e))
+                    })?,
+                    None,
+                )]);
+
+            match client.txn(txn).await {
+                Ok(resp) if resp.succeeded() => {
+                    // Success - convert to FileAttr and return
+                    let kind = if entry_info.symlink_target.is_some() {
+                        FileType::Symlink
+                    } else if entry_info.is_file {
+                        FileType::File
+                    } else {
+                        FileType::Dir
+                    };
+
+                    let size = if let Some(target) = &entry_info.symlink_target {
+                        target.len() as u64
+                    } else if entry_info.is_file {
+                        entry_info.size.unwrap_or(0).max(0) as u64
+                    } else {
+                        4096
+                    };
+
+                    return Ok(FileAttr {
+                        ino,
+                        size,
+                        kind,
+                        mode: entry_info.permission.mode,
+                        uid: entry_info.permission.uid,
+                        gid: entry_info.permission.gid,
+                        atime: entry_info.access_time,
+                        mtime: entry_info.modify_time,
+                        ctime: entry_info.create_time,
+                        nlink: entry_info.nlink,
+                    });
+                }
+                Ok(_) => {
+                    // Transaction failed (CAS conflict), retry
+                    if retry < max_retries - 1 {
+                        warn!(
+                            "CAS conflict updating attributes for inode {} (retry {}/{})",
+                            ino,
+                            retry + 1,
+                            max_retries
+                        );
+                        // Exponential backoff
+                        tokio::time::sleep(tokio::time::Duration::from_millis(5 * (1 << retry)))
+                            .await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    if retry < max_retries - 1 {
+                        warn!(
+                            "Failed to update attributes for inode {} (retry {}/{}): {}",
+                            ino,
+                            retry + 1,
+                            max_retries,
+                            e
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(5 * (1 << retry)))
+                            .await;
+                        continue;
+                    } else {
+                        error!(
+                            "Failed to update attributes for inode {} after {} retries: {}",
+                            ino, max_retries, e
+                        );
+                        return Err(MetaError::Internal(format!(
+                            "Failed to update attributes: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+        }
+
+        Err(MetaError::Internal(format!(
+            "Failed to update attributes for inode {} after {} retries (CAS conflicts)",
+            ino, max_retries
+        )))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
