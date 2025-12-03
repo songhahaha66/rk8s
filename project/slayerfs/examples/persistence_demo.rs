@@ -7,7 +7,7 @@ use slayerfs::fuse::mount::mount_vfs_unprivileged;
 use slayerfs::meta::MetaStore;
 use slayerfs::meta::config::DatabaseType;
 use slayerfs::meta::factory::MetaStoreFactory;
-use slayerfs::meta::stores::{DatabaseMetaStore, RedisMetaStore};
+use slayerfs::meta::stores::{DatabaseMetaStore, EtcdMetaStore, RedisMetaStore};
 use slayerfs::vfs::fs::VFS;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -165,6 +165,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await
                     .map_err(|e| format!("Failed to initialize metadata storage: {}", e))?
                     .store()
+            }
+            DatabaseType::Etcd { .. } => {
+                let store = EtcdMetaStore::from_config(config.clone())
+                    .await
+                    .map_err(|e| format!("Failed to initialize etcd metadata storage: {}", e))?;
+                Arc::new(store)
             }
             _ => MetaStoreFactory::<DatabaseMetaStore>::create_from_config(config.clone())
                 .await
