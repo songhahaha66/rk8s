@@ -1187,6 +1187,7 @@ impl MetaStore for EtcdMetaStore {
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         entry_info.nlink = entry_info.nlink.saturating_add(1);
         entry_info.modify_time = now;
+        entry_info.create_time = now; // Update ctime when creating hard link
         entry_info.parent_inode = parent;
         entry_info.entry_name = name.to_string();
         entry_info.deleted = false;
