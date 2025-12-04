@@ -912,6 +912,92 @@ impl EtcdMetaStore {
 
         Err(MetaError::NotFound(session_id as i64))
     }
+
+    /// Update mtime and ctime for a directory inode
+    async fn update_directory_timestamps(&self, ino: i64, now: i64) -> Result<(), MetaError> {
+        let reverse_key = Self::etcd_reverse_key(ino);
+
+        // Retry loop for optimistic locking using etcd's mod_revision
+        let max_retries = 10;
+        for retry in 0..max_retries {
+            let mut client = self.client.clone();
+
+            // Get current directory info with revision for CAS
+            let get_resp = client.get(reverse_key.as_str(), None).await.map_err(|e| {
+                MetaError::Internal(format!(
+                    "Failed to get directory key {}: {}",
+                    reverse_key, e
+                ))
+            })?;
+
+            let kv = get_resp.kvs().first().ok_or(MetaError::NotFound(ino))?;
+            let mod_revision = kv.mod_revision();
+
+            let mut entry_info: EtcdEntryInfo =
+                serde_json::from_slice(kv.value()).map_err(|e| {
+                    MetaError::Internal(format!(
+                        "Failed to deserialize directory entry info: {}",
+                        e
+                    ))
+                })?;
+
+            // Ensure this is a directory
+            if entry_info.is_file {
+                return Err(MetaError::Internal(format!(
+                    "Cannot update directory timestamps for file {}",
+                    ino
+                )));
+            }
+
+            // Update timestamps
+            entry_info.modify_time = now;
+            entry_info.create_time = now; // ctime should also be updated
+
+            // Attempt atomic update using mod_revision for precise CAS
+            let txn = Txn::new()
+                .when(vec![Compare::mod_revision(
+                    reverse_key.as_bytes(),
+                    CompareOp::Equal,
+                    mod_revision,
+                )])
+                .and_then(vec![TxnOp::put(
+                    reverse_key.as_bytes(),
+                    serde_json::to_vec(&entry_info).map_err(|e| {
+                        MetaError::Internal(format!(
+                            "Failed to serialize directory entry info: {}",
+                            e
+                        ))
+                    })?,
+                    None,
+                )]);
+
+            match client.txn(txn).await {
+                Ok(resp) if resp.succeeded() => {
+                    return Ok(());
+                }
+                Ok(_resp) => {
+                    // Transaction failed due to CAS conflict
+                    if retry >= max_retries - 1 {
+                        return Err(MetaError::Internal(format!(
+                            "Failed to update directory timestamps for {} after {} retries",
+                            ino, max_retries
+                        )));
+                    }
+                    // Continue to next retry
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * (retry + 1) as u64))
+                        .await;
+                }
+                Err(e) => {
+                    return Err(MetaError::Internal(format!(
+                        "Failed to update directory timestamps for {}: {}",
+                        ino, e
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1673,6 +1759,25 @@ impl MetaStore for EtcdMetaStore {
                     // Don't fail the operation - forward key is already updated
                 }
             }
+        }
+
+        // Update parent directory timestamps
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        // Update old parent directory timestamps
+        if let Err(e) = self.update_directory_timestamps(old_parent, now).await {
+            warn!(
+                "Rename succeeded but failed to update old parent directory timestamps: old_parent={}, error={}",
+                old_parent, e
+            );
+        }
+
+        // Update new parent directory timestamps
+        if let Err(e) = self.update_directory_timestamps(new_parent, now).await {
+            warn!(
+                "Rename succeeded but failed to update new parent directory timestamps: new_parent={}, error={}",
+                new_parent, e
+            );
         }
 
         info!(
