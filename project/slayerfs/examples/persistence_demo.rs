@@ -160,6 +160,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = slayerfs::meta::config::Config::from_file(&target_config_path)
             .map_err(|e| format!("Failed to load config file: {}", e))?;
         let meta_store: Arc<dyn MetaStore> = match &config.database.db_config {
+            DatabaseType::Sqlite { .. } | DatabaseType::Postgres { .. } => {
+                MetaStoreFactory::<DatabaseMetaStore>::create_from_config(config.clone())
+                    .await
+                    .map_err(|e| format!("Failed to initialize metadata storage: {}", e))?
+                    .store()
+            }
             DatabaseType::Redis { .. } => {
                 MetaStoreFactory::<RedisMetaStore>::create_from_config(config.clone())
                     .await
@@ -167,15 +173,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .store()
             }
             DatabaseType::Etcd { .. } => {
-                let store = EtcdMetaStore::from_config(config.clone())
+                MetaStoreFactory::<EtcdMetaStore>::create_from_config(config.clone())
                     .await
-                    .map_err(|e| format!("Failed to initialize etcd metadata storage: {}", e))?;
-                Arc::new(store)
+                    .map_err(|e| format!("Failed to initialize metadata storage: {}", e))?
+                    .store()
             }
-            _ => MetaStoreFactory::<DatabaseMetaStore>::create_from_config(config.clone())
-                .await
-                .map_err(|e| format!("Failed to initialize metadata storage: {}", e))?
-                .store(),
         };
 
         let fs = VFS::new(layout, store, meta_store.clone())
