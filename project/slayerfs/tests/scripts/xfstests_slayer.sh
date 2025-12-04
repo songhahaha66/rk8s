@@ -69,7 +69,6 @@ PERSISTENCE_BIN="$persistence_bin"
 BACKEND_DIR="$backend_dir"             
 MOUNT_DIR="$mount_dir"
 
-mkdir -p "\$BACKEND_DIR" "\$MOUNT_DIR"
 
 "\$PERSISTENCE_BIN" \
   -c "\$CONFIG_PATH" \
