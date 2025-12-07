@@ -190,7 +190,7 @@ where
             .open_handle(ino as i64, attr.clone(), read, write)
             .await;
 
-        Ok(ReplyOpen { fh, flags: 0 })
+        Ok(ReplyOpen { fh, flags })
     }
 
     // Open directory: create handle for caching
@@ -232,7 +232,10 @@ where
             .map_err(|_| libc::EIO)?;
 
         // Update atime after successful read
-        let _ = self.update_atime(ino as i64).await;
+        if let Err(e) = self.update_atime(ino as i64).await {
+            error!("Failed to update atime after read for inode {}: {}", ino, e);
+            return Err(libc::EIO.into());
+        }
 
         Ok(ReplyData {
             data: Bytes::from(data),
@@ -339,19 +342,7 @@ where
         let vattr = self
             .set_attr(ino as i64, &meta_req, meta_flags)
             .await
-            .map_err(|e| {
-                let code = match e {
-                    MetaError::NotFound(_) => libc::ENOENT,
-                    MetaError::ParentNotFound(_) => libc::ENOENT,
-                    MetaError::NotDirectory(_) => libc::ENOTDIR,
-                    MetaError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
-                    MetaError::AlreadyExists { .. } => libc::EEXIST,
-                    MetaError::NotSupported(_) | MetaError::NotImplemented => libc::ENOSYS,
-                    MetaError::InvalidPath(_) => libc::EINVAL,
-                    _ => libc::EIO,
-                };
-                Errno::from(code)
-            })?;
+            .map_err(|e| meta_error_to_errno(&e))?;
 
         let attr = vfs_to_fuse_attr(&vattr, &req);
         Ok(ReplyAttr {
@@ -1111,6 +1102,20 @@ where
 }
 
 // =============== helpers ===============
+fn meta_error_to_errno(e: &MetaError) -> Errno {
+    let code = match e {
+        MetaError::NotFound(_) => libc::ENOENT,
+        MetaError::ParentNotFound(_) => libc::ENOENT,
+        MetaError::NotDirectory(_) => libc::ENOTDIR,
+        MetaError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
+        MetaError::AlreadyExists { .. } => libc::EEXIST,
+        MetaError::NotSupported(_) | MetaError::NotImplemented => libc::ENOSYS,
+        MetaError::InvalidPath(_) => libc::EINVAL,
+        _ => libc::EIO,
+    };
+    Errno::from(code)
+}
+
 fn vfs_kind_to_fuse(k: VfsFileType) -> FuseFileType {
     match k {
         VfsFileType::Dir => FuseFileType::Directory,
