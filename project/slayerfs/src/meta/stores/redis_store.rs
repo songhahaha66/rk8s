@@ -94,8 +94,16 @@ impl RedisMetaStore {
     }
 
     fn chunk_id(&self, ino: i64, chunk_index: u64) -> u64 {
-        let ino_u64 = u64::try_from(ino).unwrap_or(0);
-        ino_u64 * CHUNK_ID_BASE + chunk_index
+        let ino_u64 = u64::try_from(ino).expect("inode must be non-negative");
+        ino_u64
+            .checked_mul(CHUNK_ID_BASE)
+            .and_then(|v| v.checked_add(chunk_index))
+            .unwrap_or_else(|| {
+                panic!(
+                    "chunk_id overflow for inode {} chunk_index {}",
+                    ino, chunk_index
+                )
+            })
     }
 
     fn deleted_set_key(&self) -> &'static str {

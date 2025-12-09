@@ -403,6 +403,11 @@ impl DatabaseMetaStore {
             0
         };
 
+        // Per POSIX semantics: when a directory has the setgid bit set, newly created
+        // entries inside inherit the directory's group (gid), but regular files
+        // do NOT inherit the setgid bit itself. Only newly created directories
+        // should carry the setgid bit. We therefore inherit `gid` from the parent
+        // but intentionally do not set the setgid bit on the file mode.
         let file_permission = Permission::new(0o100644, 0, gid);
         let file_meta = file_meta::ActiveModel {
             inode: Set(inode),
