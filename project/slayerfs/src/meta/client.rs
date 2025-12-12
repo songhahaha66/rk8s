@@ -906,12 +906,19 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
+        let old_size = self.inode_cache.get_attr(inode).await.map(|a| a.size);
         self.store.set_file_size(inode, size).await?;
 
         // Update cached attribute
         if let Some(node) = self.inode_cache.get_node(inode).await {
             let mut attr = node.attr.write().await;
             attr.size = size;
+        }
+
+        if let Some(old) = old_size
+            && size < old
+        {
+            self.inode_cache.invalidate_slices(inode).await;
         }
 
         Ok(())
@@ -1014,7 +1021,17 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     ) -> Result<FileAttr, MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
+        let old_size = if req.size.is_some() {
+            self.inode_cache.get_attr(inode).await.map(|a| a.size)
+        } else {
+            None
+        };
         let attr = self.store.set_attr(inode, req, flags).await?;
+        if let (Some(old), Some(new)) = (old_size, req.size)
+            && new < old
+        {
+            self.inode_cache.invalidate_slices(inode).await;
+        }
         self.inode_cache
             .insert_node(inode, attr.clone(), None)
             .await;

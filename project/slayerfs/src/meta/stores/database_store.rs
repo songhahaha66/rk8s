@@ -3,6 +3,7 @@
 //! Supports SQLite and PostgreSQL backends via SeaORM
 
 use crate::chuck::SliceDesc;
+use crate::chuck::chunk::DEFAULT_CHUNK_SIZE;
 use crate::meta::client::session::{Session, SessionInfo};
 use crate::meta::config::{Config, DatabaseType};
 use crate::meta::entities::session_meta::{self, Entity as SessionMeta};
@@ -23,6 +24,8 @@ use sea_query::Index;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
+
 /// Database-based metadata store
 pub struct DatabaseMetaStore {
     db: DatabaseConnection,
@@ -32,6 +35,105 @@ pub struct DatabaseMetaStore {
 }
 
 impl DatabaseMetaStore {
+    fn chunk_id(&self, ino: i64, chunk_index: u64) -> u64 {
+        let ino_u64 = u64::try_from(ino).expect("inode must be non-negative");
+        ino_u64
+            .checked_mul(CHUNK_ID_BASE)
+            .and_then(|v| v.checked_add(chunk_index))
+            .unwrap_or_else(|| {
+                panic!(
+                    "chunk_id overflow for inode {} chunk_index {}",
+                    ino, chunk_index
+                )
+            })
+    }
+
+    async fn rewrite_slices(
+        &self,
+        txn: &DatabaseTransaction,
+        chunk_id: u64,
+        slices: &[SliceDesc],
+    ) -> Result<(), MetaError> {
+        SliceMeta::delete_many()
+            .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
+            .exec(txn)
+            .await
+            .map_err(MetaError::Database)?;
+
+        for slice in slices {
+            let model = slice_meta::ActiveModel {
+                chunk_id: Set(chunk_id as i64),
+                slice_id: Set(slice.slice_id as i64),
+                offset: Set(slice.offset as i32),
+                length: Set(slice.length as i32),
+                ..Default::default()
+            };
+            model.insert(txn).await.map_err(MetaError::Database)?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_slices_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        chunk_id: u64,
+    ) -> Result<Vec<SliceDesc>, MetaError> {
+        let rows = SliceMeta::find()
+            .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
+            .order_by_asc(slice_meta::Column::Id)
+            .all(txn)
+            .await
+            .map_err(MetaError::Database)?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn prune_slices_for_truncate(
+        &self,
+        txn: &DatabaseTransaction,
+        ino: i64,
+        new_size: u64,
+        old_size: u64,
+    ) -> Result<(), MetaError> {
+        if new_size >= old_size {
+            return Ok(());
+        }
+
+        let chunk_size = DEFAULT_CHUNK_SIZE;
+        let cutoff_chunk = new_size / chunk_size;
+        let cutoff_offset = (new_size % chunk_size) as u32;
+        let old_chunk_count = old_size.div_ceil(chunk_size);
+
+        if cutoff_offset > 0 {
+            let chunk_id = self.chunk_id(ino, cutoff_chunk);
+            let mut slices = self.get_slices_txn(txn, chunk_id).await?;
+            slices.retain(|s| s.offset < cutoff_offset);
+            for slice in slices.iter_mut() {
+                let end = slice.offset + slice.length;
+                if end > cutoff_offset {
+                    slice.length = cutoff_offset - slice.offset;
+                }
+            }
+            self.rewrite_slices(txn, chunk_id, &slices).await?;
+        }
+
+        let drop_start = if cutoff_offset == 0 {
+            cutoff_chunk
+        } else {
+            cutoff_chunk + 1
+        };
+        for idx in drop_start..old_chunk_count {
+            let chunk_id = self.chunk_id(ino, idx);
+            SliceMeta::delete_many()
+                .filter(slice_meta::Column::ChunkId.eq(chunk_id as i64))
+                .exec(txn)
+                .await
+                .map_err(MetaError::Database)?;
+        }
+
+        Ok(())
+    }
+
     /// Create or open a database metadata store
     #[allow(dead_code)]
     pub async fn new(backend_path: &Path) -> Result<Self, MetaError> {
@@ -1086,18 +1188,21 @@ impl MetaStore for DatabaseMetaStore {
     }
 
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
-        let mut file_meta: file_meta::ActiveModel = FileMeta::find_by_id(ino)
-            .one(&self.db)
+        let txn = self.db.begin().await.map_err(MetaError::Database)?;
+
+        let file = FileMeta::find_by_id(ino)
+            .one(&txn)
             .await
             .map_err(|e| MetaError::Internal(e.to_string()))?
-            .ok_or(MetaError::NotFound(ino))?
-            .into();
+            .ok_or(MetaError::NotFound(ino))?;
 
-        // Only update mtime if size actually changed
-        let old_size = match &file_meta.size {
-            Set(s) | Unchanged(s) => *s as u64,
-            _ => 0,
-        };
+        let old_size = file.size as u64;
+        if size < old_size {
+            self.prune_slices_for_truncate(&txn, ino, size, old_size)
+                .await?;
+        }
+
+        let mut file_meta: file_meta::ActiveModel = file.into();
 
         file_meta.size = Set(size as i64);
 
@@ -1107,10 +1212,11 @@ impl MetaStore for DatabaseMetaStore {
         }
 
         file_meta
-            .update(&self.db)
+            .update(&txn)
             .await
             .map_err(|e| MetaError::Internal(e.to_string()))?;
 
+        txn.commit().await.map_err(MetaError::Database)?;
         Ok(())
     }
 
@@ -1165,6 +1271,10 @@ impl MetaStore for DatabaseMetaStore {
             if let Some(size_req) = req.size {
                 let new_size = size_req as i64;
                 if size != new_size {
+                    if size_req < size as u64 {
+                        self.prune_slices_for_truncate(&txn, ino, size_req, size as u64)
+                            .await?;
+                    }
                     size = new_size;
                     modify_time = now;
                 }

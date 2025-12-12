@@ -17,6 +17,7 @@ pub mod mount;
 use crate::chuck::store::BlockStore;
 use crate::meta::MetaStore;
 use crate::meta::store::{MetaError, SetAttrFlags, SetAttrRequest};
+use crate::vfs::handles::MAX_READDIR_ENTRIES;
 use crate::vfs::fs::{FileAttr as VfsFileAttr, FileType as VfsFileType, VFS};
 use bytes::Bytes;
 use rfuse3::Errno;
@@ -359,9 +360,11 @@ where
         fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<BoxStream<'a, FuseResult<DirectoryEntry>>>> {
+        let start_pos = offset.max(0) as u64;
+
         // Try to use handle first
         let entries = if fh != 0 {
-            let entries_offset = offset.saturating_sub(3) as u64;
+            let entries_offset = start_pos.saturating_sub(2);
             self.readdir_by_handle(fh, entries_offset).await
         } else {
             None
@@ -385,33 +388,57 @@ where
             }
         };
 
-        // Assemble entries including '.' and '..'; offsets reference the previous entry so start at offset+1
+        let entries = if fh == 0 {
+            let start = start_pos as usize;
+            entries
+                .into_iter()
+                .skip(start)
+                .take(MAX_READDIR_ENTRIES)
+                .collect::<Vec<_>>()
+        } else {
+            entries
+        };
+
+        // Assemble entries including '.' and '..' using stable cookies.
         let mut all: Vec<DirectoryEntry> = Vec::with_capacity(entries.len() + 2);
 
-        // Add "." and ".." entries for handle-based reads
-        if fh != 0 && offset <= 0 {
-            all.push(DirectoryEntry {
-                inode: ino,
-                kind: FuseFileType::Directory,
-                name: OsString::from("."),
-                offset: 1,
-            });
-            let parent_ino = self.parent_of(ino as i64).await.unwrap_or(self.root_ino()) as u64;
-            all.push(DirectoryEntry {
-                inode: parent_ino,
-                kind: FuseFileType::Directory,
-                name: OsString::from(".."),
-                offset: 2,
-            });
+        let mut child_start = start_pos;
+        if fh != 0 {
+            if start_pos == 0 {
+                all.push(DirectoryEntry {
+                    inode: ino,
+                    kind: FuseFileType::Directory,
+                    name: OsString::from("."),
+                    offset: 1,
+                });
+            }
+            if start_pos <= 1 {
+                let parent_ino =
+                    self.parent_of(ino as i64).await.unwrap_or(self.root_ino()) as u64;
+                all.push(DirectoryEntry {
+                    inode: parent_ino,
+                    kind: FuseFileType::Directory,
+                    name: OsString::from(".."),
+                    offset: 2,
+                });
+            }
+            child_start = start_pos.saturating_sub(2);
         }
 
-        // Actual child entries
+        // Actual child entries. Cookies are global positions:
+        // "."=1, ".."=2, children start at cookie 3.
         for (i, e) in entries.iter().enumerate() {
+            let child_index = child_start + i as u64;
+            let cookie = if fh != 0 {
+                (child_index + 3) as i64
+            } else {
+                (child_index + 1) as i64
+            };
             all.push(DirectoryEntry {
                 inode: e.ino as u64,
                 kind: vfs_kind_to_fuse(e.kind),
                 name: OsString::from(e.name.clone()),
-                offset: (offset.max(0) as u64 + i as u64 + if fh != 0 { 3 } else { 0 }) as i64,
+                offset: cookie,
             });
         }
 
