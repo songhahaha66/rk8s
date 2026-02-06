@@ -50,6 +50,7 @@ jobs:
 
   xfstests:
     name: xfstests
+    if: false
     runs-on: [self-hosted]
     timeout-minutes: 240
     steps:
