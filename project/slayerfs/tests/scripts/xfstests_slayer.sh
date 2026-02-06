@@ -11,6 +11,8 @@ log_file=/tmp/slayerfs.log
 persistence_bin="$workspace_dir/target/release/examples/persistence_demo"
 xfstests_repo=https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
 xfstests_branch="${XFSTESTS_BRANCH:-v2023.12.10}"
+slayerfs_rust_log="${slayerfs_rust_log:-slayerfs=info,slayerfs::fuse::logfs=debug}"
+slayerfs_fuse_op_log="${slayerfs_fuse_op_log:-1}"
 
 if [[ ! -f "$persistence_bin" ]]; then
     echo "Cannot find slayerfs persistence_demo binary."
@@ -72,7 +74,12 @@ PERSISTENCE_BIN="$persistence_bin"
 
 BACKEND_DIR="$backend_dir"
 MOUNT_DIR="$mount_dir"
+SLAYERFS_RUST_LOG="$slayerfs_rust_log"
+SLAYERFS_FUSE_OP_LOG="$slayerfs_fuse_op_log"
 
+if [[ "\$SLAYERFS_FUSE_OP_LOG" == "1" ]]; then
+  export RUST_LOG="\$SLAYERFS_RUST_LOG"
+fi
 
 "\$PERSISTENCE_BIN" \
   -c "\$CONFIG_PATH" \
