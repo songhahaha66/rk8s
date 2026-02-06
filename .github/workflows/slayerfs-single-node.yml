@@ -36,7 +36,8 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y pkg-config libfuse3-dev fuse3 sqlite3
+          sudo apt-get install -y pkg-config libfuse3-dev fuse3 sqlite3 protobuf-compiler
+          protoc --version
 
       - name: Build slayerfs persistence demo
         working-directory: project
