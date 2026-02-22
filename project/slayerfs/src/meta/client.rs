@@ -316,9 +316,6 @@ impl<T: MetaStore + 'static> MetaClient<T> {
             MetaError::Database(db_err) => {
                 let lower = db_err.to_string().to_ascii_lowercase();
                 lower.contains("database is locked")
-                    || lower.contains("database is busy")
-                    || lower.contains("database table is locked")
-                    || lower.contains("busy snapshot")
                     || lower.contains("code: 5")
                     || lower.contains("code: 517")
             }
@@ -331,18 +328,41 @@ impl<T: MetaStore + 'static> MetaClient<T> {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<R, MetaError>>,
     {
-        const MAX_RETRIES: usize = 8;
-        let mut backoff_ms = 5u64;
+        self.with_db_lock_retry_policy(&mut op, 8, 5, 100).await
+    }
 
-        for attempt in 0..MAX_RETRIES {
+    async fn with_db_lock_retry_write<F, Fut, R>(&self, mut op: F) -> Result<R, MetaError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<R, MetaError>>,
+    {
+        // Write-side metadata mutations are the hotspot in dirstress;
+        // use a longer retry window than read paths.
+        self.with_db_lock_retry_policy(&mut op, 32, 10, 1000).await
+    }
+
+    async fn with_db_lock_retry_policy<F, Fut, R>(
+        &self,
+        op: &mut F,
+        max_retries: usize,
+        initial_backoff_ms: u64,
+        max_backoff_ms: u64,
+    ) -> Result<R, MetaError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<R, MetaError>>,
+    {
+        let mut backoff_ms = initial_backoff_ms;
+
+        for attempt in 0..max_retries {
             match op().await {
                 Ok(value) => return Ok(value),
                 Err(err) if Self::is_db_locked_error(&err) => {
-                    if attempt + 1 >= MAX_RETRIES {
+                    if attempt + 1 >= max_retries {
                         return Err(err);
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(100);
+                    backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
                 }
                 Err(err) => return Err(err),
             }
@@ -821,7 +841,9 @@ impl<T: MetaStore + 'static> MetaClient<T> {
 
         trace!("MetaClient: Inode cache MISS for inode {}", inode);
 
-        let attr = self.store.stat(inode).await?;
+        let attr = self
+            .with_db_lock_retry(|| async { self.store.stat(inode).await })
+            .await?;
 
         if let Some(ref a) = attr {
             info!("MetaClient: Caching attr for inode {}", inode);
@@ -860,14 +882,19 @@ impl<T: MetaStore + 'static> MetaClient<T> {
 
         debug!("MetaClient: Inode cache MISS for ({}, '{}')", parent, name);
 
-        let result = self.store.lookup(parent, name).await?;
+        let result = self
+            .with_db_lock_retry(|| async { self.store.lookup(parent, name).await })
+            .await?;
 
         if let Some(ino) = result {
             info!(
                 "MetaClient: Caching lookup result ({}, '{}') -> inode {}",
                 parent, name, ino
             );
-            if let Ok(Some(attr)) = self.store.stat(ino).await {
+            if let Ok(Some(attr)) = self
+                .with_db_lock_retry(|| async { self.store.stat(ino).await })
+                .await
+            {
                 let cache_parent = matches!(attr.kind, FileType::Dir).then_some(parent);
 
                 self.inode_cache.insert_node(ino, attr, cache_parent).await;
@@ -885,10 +912,15 @@ impl<T: MetaStore + 'static> MetaClient<T> {
 
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn resolve_case(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
-        let entries = self.store.readdir(parent).await?;
+        let entries = self
+            .with_db_lock_retry(|| async { self.store.readdir(parent).await })
+            .await?;
         for entry in entries {
             if entry.name.eq_ignore_ascii_case(name) {
-                if let Ok(Some(attr)) = self.store.stat(entry.ino).await {
+                if let Ok(Some(attr)) = self
+                    .with_db_lock_retry(|| async { self.store.stat(entry.ino).await })
+                    .await
+                {
                     let cache_parent = matches!(attr.kind, FileType::Dir).then_some(parent);
 
                     self.inode_cache
@@ -1050,7 +1082,9 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         let inode = self.check_root(ino);
         self.inode_cache.invalidate_inode(inode).await;
 
-        let attr = self.store.stat(inode).await?;
+        let attr = self
+            .with_db_lock_retry(|| async { self.store.stat(inode).await })
+            .await?;
         if let Some(ref a) = attr {
             self.inode_cache.insert_node(inode, a.clone(), None).await;
         }
@@ -1113,7 +1147,9 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
 
         trace!("MetaClient: Inode cache MISS for readdir inode {}", inode);
 
-        let mut entries = self.store.readdir(inode).await?;
+        let mut entries = self
+            .with_db_lock_retry(|| async { self.store.readdir(inode).await })
+            .await?;
         // Sort once before caching so readops always return stable ordering by name.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -1170,7 +1206,13 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
 
         info!("MetaClient: mkdir operation for ({}, '{}')", parent, name);
 
-        let ino = self.store.mkdir(parent, name.clone()).await?;
+        let name_for_store = name.clone();
+        let ino = self
+            .with_db_lock_retry_write(|| {
+                let name = name_for_store.clone();
+                async move { self.store.mkdir(parent, name).await }
+            })
+            .await?;
 
         debug!("MetaClient: mkdir created inode {}, updating cache", ino);
 
@@ -1196,7 +1238,7 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         let parent = self.check_root(parent);
         info!("MetaClient: rmdir operation for ({}, '{}')", parent, name);
 
-        self.with_db_lock_retry(|| async { self.store.rmdir(parent, name).await })
+        self.with_db_lock_retry_write(|| async { self.store.rmdir(parent, name).await })
             .await?;
 
         debug!("MetaClient: rmdir completed, updating cache");
@@ -1216,7 +1258,13 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             parent, name
         );
 
-        let ino = self.store.create_file(parent, name.clone()).await?;
+        let name_for_store = name.clone();
+        let ino = self
+            .with_db_lock_retry_write(|| {
+                let name = name_for_store.clone();
+                async move { self.store.create_file(parent, name).await }
+            })
+            .await?;
 
         info!(
             "MetaClient: create_file created inode {}, updating cache",
@@ -1257,7 +1305,13 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             inode, parent, name
         );
 
-        let attr = self.store.link(inode, parent, name).await?;
+        let name_for_store = name.to_string();
+        let attr = self
+            .with_db_lock_retry(|| {
+                let name = name_for_store.clone();
+                async move { self.store.link(inode, parent, &name).await }
+            })
+            .await?;
 
         self.inode_cache
             .ensure_node_in_cache(parent, &self.store, None)
@@ -1302,7 +1356,15 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             parent, name, target
         );
 
-        let (ino, attr) = self.store.symlink(parent, name, target).await?;
+        let name_for_store = name.to_string();
+        let target_for_store = target.to_string();
+        let (ino, attr) = self
+            .with_db_lock_retry_write(|| {
+                let name = name_for_store.clone();
+                let target = target_for_store.clone();
+                async move { self.store.symlink(parent, &name, &target).await }
+            })
+            .await?;
 
         debug!("MetaClient: symlink created inode {}, updating cache", ino);
 
@@ -1338,7 +1400,7 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         let parent = self.check_root(parent);
         info!("MetaClient: unlink operation for ({}, '{}')", parent, name);
 
-        self.with_db_lock_retry(|| async { self.store.unlink(parent, name).await })
+        self.with_db_lock_retry_write(|| async { self.store.unlink(parent, name).await })
             .await?;
 
         debug!("MetaClient: unlink completed, updating cache");
@@ -1403,9 +1465,18 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         }
 
         // Execute the store-level rename with atomic cache updates
-        self.store
-            .rename(old_parent, old_name, new_parent, new_name.clone())
-            .await?;
+        let old_name_for_store = old_name.to_string();
+        let new_name_for_store = new_name.clone();
+        self.with_db_lock_retry_write(|| {
+            let old_name = old_name_for_store.clone();
+            let new_name = new_name_for_store.clone();
+            async move {
+                self.store
+                    .rename(old_parent, &old_name, new_parent, new_name)
+                    .await
+            }
+        })
+        .await?;
 
         debug!("MetaClient: rename completed, updating cache");
 
@@ -1519,9 +1590,18 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             .ok_or_else(|| MetaError::NotFound(new_parent))?;
 
         // Execute the store-level exchange
-        self.store
-            .rename_exchange(old_parent, old_name, new_parent, new_name)
-            .await?;
+        let old_name_for_store = old_name.to_string();
+        let new_name_for_store = new_name.to_string();
+        self.with_db_lock_retry_write(|| {
+            let old_name = old_name_for_store.clone();
+            let new_name = new_name_for_store.clone();
+            async move {
+                self.store
+                    .rename_exchange(old_parent, &old_name, new_parent, &new_name)
+                    .await
+            }
+        })
+        .await?;
 
         debug!("MetaClient: rename_exchange completed, updating cache");
 
@@ -1693,7 +1773,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     async fn set_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
-        self.store.set_file_size(inode, size).await?;
+        self.with_db_lock_retry(|| async { self.store.set_file_size(inode, size).await })
+            .await?;
 
         // Update cached attribute
         if let Some(node) = self.inode_cache.get_node(inode).await {
@@ -1708,7 +1789,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     async fn extend_file_size(&self, ino: i64, size: u64) -> Result<(), MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
-        self.store.extend_file_size(inode, size).await?;
+        self.with_db_lock_retry(|| async { self.store.extend_file_size(inode, size).await })
+            .await?;
 
         if let Some(node) = self.inode_cache.get_node(inode).await {
             let mut attr = node.attr.write().await;
@@ -1724,7 +1806,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     async fn truncate(&self, ino: i64, size: u64, chunk_size: u64) -> Result<(), MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
-        self.store.truncate(inode, size, chunk_size).await?;
+        self.with_db_lock_retry(|| async { self.store.truncate(inode, size, chunk_size).await })
+            .await?;
         self.inode_cache.invalidate_inode(inode).await;
         Ok(())
     }
@@ -1736,7 +1819,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             return Ok(vec![(None, "/".to_string())]);
         }
 
-        self.store.get_names(inode).await
+        self.with_db_lock_retry(|| async { self.store.get_names(inode).await })
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
@@ -1746,7 +1830,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             return Ok(vec![(self.root(), "/".to_string())]);
         }
 
-        self.store.get_dentries(inode).await
+        self.with_db_lock_retry(|| async { self.store.get_dentries(inode).await })
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(dir_ino))]
@@ -1756,7 +1841,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             return Ok(None);
         }
 
-        self.store.get_dir_parent(inode).await
+        self.with_db_lock_retry(|| async { self.store.get_dir_parent(inode).await })
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
@@ -1766,14 +1852,16 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             return Ok(vec!["/".to_string()]);
         }
 
-        self.store.get_paths(inode).await
+        self.with_db_lock_retry(|| async { self.store.get_paths(inode).await })
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn read_symlink(&self, ino: i64) -> Result<String, MetaError> {
         let inode = self.check_root(ino);
         info!("MetaClient: read_symlink request for inode {}", inode);
-        self.store.read_symlink(inode).await
+        self.with_db_lock_retry(|| async { self.store.read_symlink(inode).await })
+            .await
     }
 
     #[tracing::instrument(
@@ -1810,7 +1898,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(ino))]
     async fn close(&self, ino: i64) -> Result<(), MetaError> {
         let inode = self.check_root(ino);
-        self.store.close(inode).await
+        self.with_db_lock_retry(|| async { self.store.close(inode).await })
+            .await
     }
 
     #[tracing::instrument(
@@ -1834,7 +1923,10 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     ) -> Result<(), MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
-        self.store.write(inode, chunk_id, slice, new_size).await?;
+        self.with_db_lock_retry(|| async {
+            self.store.write(inode, chunk_id, slice, new_size).await
+        })
+        .await?;
 
         let (inode_from_chunk, chunk_index) = extract_ino_and_chunk_index(chunk_id);
         self.inode_cache
@@ -1905,7 +1997,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         self.ensure_writable()?;
 
         let (inode, chunk_index) = extract_ino_and_chunk_index(chunk_id);
-        self.store.append_slice(chunk_id, slice).await?;
+        self.with_db_lock_retry(|| async { self.store.append_slice(chunk_id, slice).await })
+            .await?;
         self.inode_cache
             .append_slice(inode, chunk_index, slice)
             .await;
