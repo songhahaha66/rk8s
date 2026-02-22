@@ -100,7 +100,10 @@ where
     }
 
     fn attr_for(&self, fh: u64) -> Option<FileAttr> {
-        self.handles.get(&fh).map(|entry| entry.attr())
+        if let Some(handle) = self.handles.get(&fh) {
+            return Some(handle.attr());
+        }
+        self.dir_handles.get(&fh).map(|entry| entry.attr.clone())
     }
 
     fn attr_for_inode(&self, ino: i64) -> Option<FileAttr> {
@@ -108,6 +111,11 @@ where
         for fh in fhs {
             if let Some(handle) = self.handles.get(&fh) {
                 return Some(handle.attr());
+            }
+        }
+        for handle in self.dir_handles.iter() {
+            if handle.ino == ino {
+                return Some(handle.attr.clone());
             }
         }
         None
