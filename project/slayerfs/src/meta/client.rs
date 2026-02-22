@@ -311,6 +311,48 @@ impl<T: MetaStore + 'static> MetaClient<T> {
         }
     }
 
+    fn is_db_locked_error(err: &MetaError) -> bool {
+        match err {
+            MetaError::Database(db_err) => {
+                let lower = db_err.to_string().to_ascii_lowercase();
+                lower.contains("database is locked")
+                    || lower.contains("database is busy")
+                    || lower.contains("database table is locked")
+                    || lower.contains("busy snapshot")
+                    || lower.contains("code: 5")
+                    || lower.contains("code: 517")
+            }
+            _ => false,
+        }
+    }
+
+    async fn with_db_lock_retry<F, Fut, R>(&self, mut op: F) -> Result<R, MetaError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<R, MetaError>>,
+    {
+        const MAX_RETRIES: usize = 8;
+        let mut backoff_ms = 5u64;
+
+        for attempt in 0..MAX_RETRIES {
+            match op().await {
+                Ok(value) => return Ok(value),
+                Err(err) if Self::is_db_locked_error(&err) => {
+                    if attempt + 1 >= MAX_RETRIES {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(100);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(MetaError::Internal(
+            "db lock retry loop exited unexpectedly".to_string(),
+        ))
+    }
+
     fn ensure_background_jobs(&self) -> Result<(), MetaError> {
         if self.options.no_background_jobs {
             Err(MetaError::NotSupported(
@@ -1154,7 +1196,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         let parent = self.check_root(parent);
         info!("MetaClient: rmdir operation for ({}, '{}')", parent, name);
 
-        self.store.rmdir(parent, name).await?;
+        self.with_db_lock_retry(|| async { self.store.rmdir(parent, name).await })
+            .await?;
 
         debug!("MetaClient: rmdir completed, updating cache");
 
@@ -1295,7 +1338,8 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         let parent = self.check_root(parent);
         info!("MetaClient: unlink operation for ({}, '{}')", parent, name);
 
-        self.store.unlink(parent, name).await?;
+        self.with_db_lock_retry(|| async { self.store.unlink(parent, name).await })
+            .await?;
 
         debug!("MetaClient: unlink completed, updating cache");
 
@@ -1745,7 +1789,12 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     ) -> Result<FileAttr, MetaError> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
-        let attr = self.store.set_attr(inode, req, flags).await?;
+        let attr = self
+            .with_db_lock_retry(|| async {
+                let flags_for_call = SetAttrFlags::from_bits_retain(flags.bits());
+                self.store.set_attr(inode, req, flags_for_call).await
+            })
+            .await?;
         self.inode_cache
             .insert_node(inode, attr.clone(), None)
             .await;

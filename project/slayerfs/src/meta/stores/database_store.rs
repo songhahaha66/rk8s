@@ -30,8 +30,8 @@ use sea_orm::ActiveValue::{self, Set, Unchanged};
 use sea_orm::prelude::Uuid;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Schema,
-    TransactionTrait, sea_query,
+    DbBackend, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Schema,
+    Statement, TransactionTrait, sea_query,
 };
 use sea_query::Index;
 use std::collections::HashMap;
@@ -57,6 +57,26 @@ pub struct DatabaseMetaStore {
 }
 
 impl DatabaseMetaStore {
+    async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), MetaError> {
+        let pragmas = [
+            "PRAGMA journal_mode=WAL;",
+            "PRAGMA synchronous=NORMAL;",
+            "PRAGMA busy_timeout=5000;",
+            "PRAGMA temp_store=MEMORY;",
+        ];
+
+        for pragma in pragmas {
+            db.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                pragma.to_string(),
+            ))
+            .await
+            .map_err(MetaError::Database)?;
+        }
+
+        Ok(())
+    }
+
     /// Create or open a database metadata store
     #[allow(dead_code)]
     pub async fn new(backend_path: &Path) -> Result<Self, MetaError> {
@@ -154,6 +174,13 @@ impl DatabaseMetaStore {
         msg.contains("duplicate") || msg.contains("unique")
     }
 
+    fn is_database_locked(err: &sea_orm::DbErr) -> bool {
+        let msg = err.to_string().to_lowercase();
+        msg.contains("database is locked")
+            || msg.contains("(code: 5)")
+            || msg.contains("(code: 517)")
+    }
+
     async fn set_counter_floor(
         db: &DatabaseConnection,
         key: &str,
@@ -195,39 +222,41 @@ impl DatabaseMetaStore {
     }
 
     async fn alloc_counter_id(&self, key: &str) -> Result<i64, MetaError> {
-        const MAX_RETRIES: usize = 64;
-
-        for _ in 0..MAX_RETRIES {
-            let Some(row) = CounterMeta::find_by_id(key.to_string())
-                .one(&self.db)
-                .await
-                .map_err(MetaError::Database)?
-            else {
-                Self::set_counter_floor(&self.db, key, 1).await?;
-                continue;
-            };
-
-            let next = row
-                .value
-                .checked_add(1)
-                .ok_or_else(|| MetaError::Internal(format!("counter overflow for key {key}")))?;
-
-            let updated = CounterMeta::update_many()
-                .col_expr(counter_meta::Column::Value, sea_query::Expr::value(next))
-                .filter(counter_meta::Column::Name.eq(key))
-                .filter(counter_meta::Column::Value.eq(row.value))
-                .exec(&self.db)
-                .await
-                .map_err(MetaError::Database)?;
-
-            if updated.rows_affected == 1 {
-                return Ok(row.value);
+        let db_backend = self.db.get_database_backend();
+        let stmt = match db_backend {
+            DbBackend::Sqlite => Statement::from_sql_and_values(
+                db_backend,
+                r#"
+                INSERT INTO counter_meta (name, value) VALUES (?, 2)
+                ON CONFLICT(name) DO UPDATE SET value = counter_meta.value + 1
+                RETURNING value - 1 AS allocated
+                "#,
+                [key.into()],
+            ),
+            DbBackend::Postgres => Statement::from_sql_and_values(
+                db_backend,
+                r#"
+                INSERT INTO counter_meta (name, value) VALUES ($1, 2)
+                ON CONFLICT(name) DO UPDATE SET value = counter_meta.value + 1
+                RETURNING value - 1 AS allocated
+                "#,
+                [key.into()],
+            ),
+            _ => {
+                return Err(MetaError::NotSupported(
+                    "alloc_counter_id only supports sqlite/postgres".to_string(),
+                ));
             }
-        }
+        };
 
-        Err(MetaError::Internal(format!(
-            "failed to allocate counter value for key {key}: contention limit exceeded"
-        )))
+        let row = self
+            .db
+            .query_one(stmt)
+            .await
+            .map_err(MetaError::Database)?
+            .ok_or_else(|| MetaError::Internal("alloc_counter_id returned no row".to_string()))?;
+
+        row.try_get("", "allocated").map_err(MetaError::Database)
     }
 
     /// Create database connection
@@ -253,6 +282,7 @@ impl DatabaseMetaStore {
                     .idle_timeout(Duration::from_secs(30))
                     .acquire_timeout(Duration::from_secs(30));
                 let db = Database::connect(opts).await?;
+                Self::apply_sqlite_pragmas(&db).await?;
                 Ok(db)
             }
             DatabaseType::Postgres { url } => {
@@ -1243,7 +1273,26 @@ impl MetaStore for DatabaseMetaStore {
 
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn create_file(&self, parent: i64, name: String) -> Result<i64, MetaError> {
-        self.create_file_internal(parent, name).await
+        const MAX_RETRIES: usize = 8;
+        let mut backoff_ms = 5u64;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.create_file_internal(parent, name.clone()).await {
+                Ok(ino) => return Ok(ino),
+                Err(MetaError::Database(db_err)) if Self::is_database_locked(&db_err) => {
+                    if attempt + 1 == MAX_RETRIES {
+                        return Err(MetaError::Database(db_err));
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(100);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(MetaError::Internal(
+            "create_file retry loop exited unexpectedly".to_string(),
+        ))
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
@@ -2631,12 +2680,12 @@ impl MetaStore for DatabaseMetaStore {
             session_info: Set(payload),
             expire: Set(expire),
         };
-        if let Err(e) = session.insert(&self.db).await {
+        if let Err(e) = session.insert(&txn).await {
             let _ = txn.rollback().await;
             return Err(MetaError::Database(e));
         }
-        self.set_sid(session_id)?;
         txn.commit().await.map_err(MetaError::Database)?;
+        self.set_sid(session_id)?;
 
         tokio::spawn(Self::life_cycle(token.clone(), session_id, self.db.clone()));
 
