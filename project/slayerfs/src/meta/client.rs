@@ -1187,6 +1187,7 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         let (done_flag, prefetch_task) = MetaClient::spawn_batch_prefetch(self, inode, &entries);
         Ok(DirHandle::with_prefetch_task(
             inode,
+            attr,
             entries,
             prefetch_task,
             done_flag,

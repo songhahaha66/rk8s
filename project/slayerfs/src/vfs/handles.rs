@@ -304,6 +304,7 @@ impl HandleFlags {
 /// Directory handle for caching directory listing during opendir-releasedir lifecycle
 pub struct DirHandle {
     pub(crate) ino: i64,
+    pub(crate) attr: FileAttr,
     pub(crate) entries: Vec<DirEntry>,
     #[allow(dead_code)]
     pub(crate) opened_at: Instant,
@@ -315,9 +316,10 @@ pub struct DirHandle {
 
 impl DirHandle {
     #[allow(unused)]
-    pub(crate) fn new(ino: i64, entries: Vec<DirEntry>) -> Self {
+    pub(crate) fn new(ino: i64, attr: FileAttr, entries: Vec<DirEntry>) -> Self {
         Self {
             ino,
+            attr,
             entries,
             opened_at: Instant::now(),
             prefetch_task: None,
@@ -327,12 +329,14 @@ impl DirHandle {
 
     pub(crate) fn with_prefetch_task(
         ino: i64,
+        attr: FileAttr,
         entries: Vec<DirEntry>,
         task: JoinHandle<()>,
         done_flag: Arc<AtomicBool>,
     ) -> Self {
         Self {
             ino,
+            attr,
             entries,
             opened_at: Instant::now(),
             prefetch_task: Some(task),
