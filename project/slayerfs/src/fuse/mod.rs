@@ -407,7 +407,7 @@ where
         debug!(ino, fh, offset, "fuse.readdir");
         // Try to use handle first
         let entries = if fh != 0 {
-            let entries_offset = offset.saturating_sub(3) as u64;
+            let entries_offset = offset.saturating_sub(2) as u64;
             self.readdir(fh, entries_offset)
         } else {
             None
@@ -434,8 +434,8 @@ where
         // Assemble entries including '.' and '..'; offsets reference the previous entry so start at offset+1
         let mut all: Vec<DirectoryEntry> = Vec::with_capacity(entries.len() + 2);
 
-        // Add "." and ".." entries for handle-based reads
-        if fh != 0 && offset <= 0 {
+        // Add "." and ".." entries for both handle-based and stateless fallback reads.
+        if offset <= 0 {
             all.push(DirectoryEntry {
                 inode: ino,
                 kind: FuseFileType::Directory,
@@ -456,11 +456,13 @@ where
 
         // Actual child entries
         for (i, e) in entries.iter().enumerate() {
+            let entries_offset = offset.saturating_sub(2) as u64;
+            let entry_offset = (entries_offset + i as u64 + 3) as i64;
             all.push(DirectoryEntry {
                 inode: e.ino as u64,
                 kind: vfs_kind_to_fuse(e.kind),
                 name: OsString::from(e.name.clone()),
-                offset: (offset.max(0) as u64 + i as u64 + if fh != 0 { 3 } else { 0 }) as i64,
+                offset: entry_offset,
             });
         }
 
@@ -484,48 +486,49 @@ where
 
         // Try to use handle first
         let entries_from_handle = if fh != 0 {
-            if offset == 0 {
-                // Add "." entry
-                if let Some(attr) = self.stat_ino(ino as i64).await {
-                    let fattr = vfs_to_fuse_attr(&attr, &req);
-                    all.push(DirectoryEntryPlus {
-                        inode: ino,
-                        generation: 0,
-                        kind: FuseFileType::Directory,
-                        name: OsString::from("."),
-                        offset: 1,
-                        attr: fattr,
-                        entry_ttl: ttl,
-                        attr_ttl: ttl,
-                    });
-                } else {
-                    return Err(libc::ENOENT.into());
-                }
-                // Add ".." entry
-                let parent_ino = self
-                    .parent_of(ino as i64)
-                    .await
-                    .unwrap_or_else(|| self.root_ino()) as u64;
-                if let Some(pattr) = self.stat_ino(parent_ino as i64).await {
-                    let f = vfs_to_fuse_attr(&pattr, &req);
-                    all.push(DirectoryEntryPlus {
-                        inode: parent_ino,
-                        generation: 0,
-                        kind: FuseFileType::Directory,
-                        name: OsString::from(".."),
-                        offset: 2,
-                        attr: f,
-                        entry_ttl: ttl,
-                        attr_ttl: ttl,
-                    });
-                }
-            }
-
             let entries_offset = offset.saturating_sub(2);
             self.readdir(fh, entries_offset)
         } else {
             None
         };
+
+        // Add "." and ".." for both handle-based and stateless fallback reads.
+        if offset == 0 {
+            // Add "." entry
+            if let Some(attr) = self.stat_ino(ino as i64).await {
+                let fattr = vfs_to_fuse_attr(&attr, &req);
+                all.push(DirectoryEntryPlus {
+                    inode: ino,
+                    generation: 0,
+                    kind: FuseFileType::Directory,
+                    name: OsString::from("."),
+                    offset: 1,
+                    attr: fattr,
+                    entry_ttl: ttl,
+                    attr_ttl: ttl,
+                });
+            } else {
+                return Err(libc::ENOENT.into());
+            }
+            // Add ".." entry
+            let parent_ino = self
+                .parent_of(ino as i64)
+                .await
+                .unwrap_or_else(|| self.root_ino()) as u64;
+            if let Some(pattr) = self.stat_ino(parent_ino as i64).await {
+                let f = vfs_to_fuse_attr(&pattr, &req);
+                all.push(DirectoryEntryPlus {
+                    inode: parent_ino,
+                    generation: 0,
+                    kind: FuseFileType::Directory,
+                    name: OsString::from(".."),
+                    offset: 2,
+                    attr: f,
+                    entry_ttl: ttl,
+                    attr_ttl: ttl,
+                });
+            }
+        }
 
         // Fallback to stateless mode if handle not found
         let entries = if let Some(e) = entries_from_handle {
