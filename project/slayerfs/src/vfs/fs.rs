@@ -441,6 +441,21 @@ where
     /// This is called during flush/fsync to handle mmap writes where the kernel
     /// doesn't call the write() callback
     pub(crate) async fn update_mtime_ctime(&self, ino: i64) -> Result<(), VfsError> {
+        fn is_db_locked(err: &VfsError) -> bool {
+            match err {
+                VfsError::Meta(MetaError::Database(db_err)) => {
+                    let lower = db_err.to_string().to_ascii_lowercase();
+                    lower.contains("database is locked")
+                        || lower.contains("database is busy")
+                        || lower.contains("database table is locked")
+                        || lower.contains("busy snapshot")
+                        || lower.contains("code: 5")
+                        || lower.contains("code: 517")
+                }
+                _ => false,
+            }
+        }
+
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let now = SystemTime::now()
@@ -454,11 +469,33 @@ where
             ..Default::default()
         };
 
-        self.core
-            .meta_layer
-            .set_attr(ino, &req, SetAttrFlags::empty())
-            .await
-            .map_err(VfsError::from)?;
+        const MAX_RETRIES: usize = 8;
+        let mut backoff_ms = 5u64;
+        for attempt in 0..MAX_RETRIES {
+            let result = self
+                .core
+                .meta_layer
+                .set_attr(ino, &req, SetAttrFlags::empty())
+                .await
+                .map_err(VfsError::from);
+
+            match result {
+                Ok(_) => break,
+                Err(err) if is_db_locked(&err) => {
+                    if attempt + 1 >= MAX_RETRIES {
+                        tracing::warn!(
+                            ino,
+                            "mtime/ctime update failed after retries due to lock contention: {}",
+                            err
+                        );
+                        return Err(err);
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(100);
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
         // Update handle cache if exists
         if let Some(mut attr) = self.state.handles.attr_for_inode(ino) {
