@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     image::{config::normalize_path, context::StageContext as Context},
-    pull::sync_pull_or_get_image,
+    pull::sync_pull_or_get_image_with_policy_and_output,
     storage::full_image_ref,
     task::{CopyTask, RunTask, TaskExec},
 };
@@ -264,7 +264,12 @@ impl<P: AsRef<Path>> InstructionExt<P> for FromInstruction {
 
         let img_ref = full_image_ref(&image_parsed.image, image_parsed.tag.as_deref());
 
-        let (_, layers) = sync_pull_or_get_image(&img_ref, None::<String>)?;
+        let (_, layers) = sync_pull_or_get_image_with_policy_and_output(
+            &img_ref,
+            None::<String>,
+            ctx.no_cache,
+            ctx.quiet,
+        )?;
 
         // add image alias mapping
         if let Some(alias) = &self.alias {
@@ -283,8 +288,15 @@ impl<P: AsRef<Path>> InstructionExt<P> for FromInstruction {
 
 impl<P: AsRef<Path>> InstructionExt<P> for ArgInstruction {
     fn execute(&self, ctx: &mut Context<P>) -> Result<()> {
-        let val = self.value.as_ref().map(|val| val.content.clone());
-        ctx.args.insert(self.name.content.clone(), val);
+        let key = self.name.content.clone();
+        let val = ctx
+            .cli_build_args
+            .get(&key)
+            .cloned()
+            .or_else(|| self.value.as_ref().map(|val| val.content.clone()))
+            .or_else(|| ctx.args.get(&key).cloned().flatten())
+            .or_else(|| ctx.global_args.get(key.as_str()).cloned().flatten());
+        ctx.args.insert(key, val);
         Ok(())
     }
 }
@@ -328,9 +340,16 @@ impl<P: AsRef<Path>> InstructionExt<P> for RunInstruction {
         }
         // println!("Executing RUN command: {:?}", command_args);
 
-        let envp: Vec<String> = ctx
-            .image_config
-            .envp
+        let mut merged_envp = ctx.image_config.envp.clone();
+        for (key, value) in &ctx.args {
+            if merged_envp.contains_key(key) {
+                continue;
+            }
+            if let Some(value) = value {
+                merged_envp.insert(key.clone(), value.clone());
+            }
+        }
+        let envp: Vec<String> = merged_envp
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
@@ -340,6 +359,7 @@ impl<P: AsRef<Path>> InstructionExt<P> for RunInstruction {
             envp,
             working_dir: ctx.image_config.working_dir.clone(),
             user: ctx.image_config.user.clone(),
+            quiet: ctx.quiet,
         };
         task.execute(ctx.mount_config)
     }
@@ -444,13 +464,26 @@ impl<P: AsRef<Path>> InstructionExt<P> for CopyInstruction {
             .map(|s| build_ctx.join(&s.content))
             .collect();
 
-        let task = CopyTask { src, dest };
+        let task = CopyTask {
+            src,
+            dest,
+            quiet: ctx.quiet,
+        };
         task.execute(ctx.mount_config)
     }
 }
 
 impl<P: AsRef<Path>> InstructionExt<P> for EnvInstruction {
     fn execute(&self, ctx: &mut Context<P>) -> Result<()> {
+        let mut expand_scope = HashMap::new();
+        for (key, value) in &ctx.args {
+            if let Some(value) = value {
+                expand_scope.insert(key.clone(), value.clone());
+            }
+        }
+        // ENV has higher precedence for future expansion.
+        expand_scope.extend(ctx.image_config.envp.clone());
+
         for var in self.vars.iter() {
             let mut val = Vec::new();
             for component in var.value.components.iter() {
@@ -464,7 +497,7 @@ impl<P: AsRef<Path>> InstructionExt<P> for EnvInstruction {
                 }
             }
             let raw_val = val.join(" ");
-            let expanded_val = expand_env_value(&raw_val, &ctx.image_config.envp);
+            let expanded_val = expand_env_value(&raw_val, &expand_scope);
             ctx.image_config
                 .add_envp(var.key.content.clone(), expanded_val);
         }
@@ -474,11 +507,20 @@ impl<P: AsRef<Path>> InstructionExt<P> for EnvInstruction {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, path::PathBuf};
 
-    use crate::image::config::DEFAULT_ENV;
+    use dockerfile_parser::{Dockerfile, Instruction};
 
-    use super::expand_env_value;
+    use crate::{
+        image::{
+            BuildProgressMode,
+            config::{DEFAULT_ENV, ImageConfig},
+            context::StageContext,
+        },
+        overlayfs::MountConfig,
+    };
+
+    use super::{InstructionExt, expand_env_value};
 
     #[test]
     fn test_expand_env_value_path_and_braced_vars() {
@@ -500,5 +542,129 @@ mod tests {
 
         let expanded = expand_env_value(r"\$FOO:$FOO:$UNKNOWN", &envp);
         assert_eq!(expanded, "$FOO:bar:");
+    }
+
+    #[test]
+    fn test_arg_instruction_stage_default_overrides_global_default_without_cli() {
+        let dockerfile = Dockerfile::parse(
+            r#"
+FROM scratch
+ARG BASE=alpine
+"#,
+        )
+        .unwrap();
+        let arg_inst = dockerfile
+            .instructions
+            .iter()
+            .find(|inst| matches!(inst, Instruction::Arg(_)))
+            .unwrap();
+
+        let mut mount_config = MountConfig::default();
+        let mut image_config = ImageConfig::default();
+        let mut image_aliases = HashMap::new();
+        let cli_build_args = HashMap::new();
+        let global_args = HashMap::from([("BASE".to_string(), Some("ubuntu".to_string()))]);
+
+        let mut ctx = StageContext {
+            mount_config: &mut mount_config,
+            image_config: &mut image_config,
+            image_aliases: &mut image_aliases,
+            args: HashMap::new(),
+            cli_build_args: &cli_build_args,
+            global_args: &global_args,
+            build_context: PathBuf::from("."),
+            no_cache: false,
+            quiet: true,
+            progress_mode: BuildProgressMode::Plain,
+        };
+
+        arg_inst.execute(&mut ctx).unwrap();
+        assert_eq!(
+            ctx.args.get("BASE").and_then(|value| value.as_deref()),
+            Some("alpine")
+        );
+    }
+
+    #[test]
+    fn test_arg_instruction_cli_overrides_stage_and_global_defaults() {
+        let dockerfile = Dockerfile::parse(
+            r#"
+FROM scratch
+ARG BASE=alpine
+"#,
+        )
+        .unwrap();
+        let arg_inst = dockerfile
+            .instructions
+            .iter()
+            .find(|inst| matches!(inst, Instruction::Arg(_)))
+            .unwrap();
+
+        let mut mount_config = MountConfig::default();
+        let mut image_config = ImageConfig::default();
+        let mut image_aliases = HashMap::new();
+        let cli_build_args = HashMap::from([("BASE".to_string(), "debian".to_string())]);
+        let global_args = HashMap::from([("BASE".to_string(), Some("ubuntu".to_string()))]);
+
+        let mut ctx = StageContext {
+            mount_config: &mut mount_config,
+            image_config: &mut image_config,
+            image_aliases: &mut image_aliases,
+            args: HashMap::new(),
+            cli_build_args: &cli_build_args,
+            global_args: &global_args,
+            build_context: PathBuf::from("."),
+            no_cache: false,
+            quiet: true,
+            progress_mode: BuildProgressMode::Plain,
+        };
+
+        arg_inst.execute(&mut ctx).unwrap();
+        assert_eq!(
+            ctx.args.get("BASE").and_then(|value| value.as_deref()),
+            Some("debian")
+        );
+    }
+
+    #[test]
+    fn test_env_instruction_uses_previous_scope_within_same_instruction() {
+        let dockerfile = Dockerfile::parse(
+            r#"
+FROM scratch
+ENV A=hello
+ENV A=1 B=$A
+"#,
+        )
+        .unwrap();
+
+        let mut mount_config = MountConfig::default();
+        let mut image_config = ImageConfig::default();
+        let mut image_aliases = HashMap::new();
+        let cli_build_args = HashMap::new();
+        let global_args = HashMap::new();
+
+        let mut ctx = StageContext {
+            mount_config: &mut mount_config,
+            image_config: &mut image_config,
+            image_aliases: &mut image_aliases,
+            args: HashMap::new(),
+            cli_build_args: &cli_build_args,
+            global_args: &global_args,
+            build_context: PathBuf::from("."),
+            no_cache: false,
+            quiet: true,
+            progress_mode: BuildProgressMode::Plain,
+        };
+
+        dockerfile
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst, Instruction::Env(_)))
+            .for_each(|inst| {
+                inst.execute(&mut ctx).unwrap();
+            });
+
+        assert_eq!(ctx.image_config.envp.get("A"), Some(&"1".to_string()));
+        assert_eq!(ctx.image_config.envp.get("B"), Some(&"hello".to_string()));
     }
 }

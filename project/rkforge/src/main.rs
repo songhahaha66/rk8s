@@ -22,7 +22,7 @@ mod storage;
 mod task;
 mod utils;
 use crate::args::{Cli, Commands};
-use crate::commands::{compose, container, pod, volume};
+use crate::commands::{compose, config_cli, container, pod, volume};
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::prelude::*;
@@ -36,6 +36,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Build(args) => image::build_image(&args),
+        Commands::Config(args) => config_cli::config(args),
         Commands::Cleanup(args) => overlayfs::cleanup(args),
         Commands::Compose(cmd) => compose::compose_execute(cmd),
         Commands::Copy(args) => copy::copy(args),
@@ -85,5 +86,12 @@ fn main() -> Result<()> {
         Commands::State(args) => container::state_container(&args.container_name),
         Commands::Volume(cmd) => volume::volume_execute(cmd),
         Commands::ExecInternal(args) => run::exec_internal(args),
+        Commands::Kill(args) => container::kill_container(&args.container_name, &args.signal),
+        Commands::Stop(args) => container::stop_container(&args.container_name, args.timeout),
+        Commands::Wait(args) => container::wait_container(&args.container_name, args.timeout),
+        Commands::Rm(args) => {
+            container::rm_container(args.container_name.as_deref(), args.force, args.all)
+        }
+        Commands::Attach(args) => container::attach_container(&args.container_name),
     }
 }
